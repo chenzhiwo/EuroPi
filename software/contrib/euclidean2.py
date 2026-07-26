@@ -84,6 +84,12 @@ import time
 from utime import ticks_diff, ticks_ms
 
 
+# 状态持久化总开关：False 时完全屏蔽 save states 功能——既不从 flash 加载
+# 历史状态（每次启动都用默认/初始状态），也不在运行中写盘（避免阻塞式写
+# flash 造成的 25~60ms 周期卡顿）。需要保留参数时改回 True。
+SAVE_STATES = False
+
+
 # 合并模式（对齐 Digitakt 2 双机器）
 MERGE_MODES = ["OR", "AND", "XOR", "G1", "G2"]
 MERGE_OR, MERGE_AND, MERGE_XOR, MERGE_G1, MERGE_G2 = range(5)
@@ -264,7 +270,8 @@ class Euclidean2(EuroPiScript):
         self.gate_timer = machine.Timer()
         self.clock_running = False
 
-        self.load_state()
+        if SAVE_STATES:
+            self.load_state()
 
         @din.handler
         def on_clock_rise():
@@ -553,7 +560,8 @@ class Euclidean2(EuroPiScript):
     # ---------------- 状态持久化 ----------------
     def on_changed(self):
         self.dirty = True
-        self._dirty_save = True
+        if SAVE_STATES:
+            self._dirty_save = True
 
     def get_state(self):
         return {
@@ -612,6 +620,8 @@ class Euclidean2(EuroPiScript):
             self.set_state(state)
 
     def save_state(self):
+        if not SAVE_STATES:
+            return
         if not self._dirty_save:
             return
         if self.last_saved() < 1000:
