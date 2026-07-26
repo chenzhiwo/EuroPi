@@ -1,20 +1,51 @@
 # EuroPi 6通道双欧几里得音序器 实现规范
 # 适配128*32显示屏 | 6路独立CV输出 | 无Shift时序偏移
 
+〇、实现架构（重构后单文件，参照 europi-ws/ARCHITECTURE.md）
+================================================================
+euclidean2.py 现为**单文件**，但内部严格按 ARCHITECTURE.md 的分层原则组织，各层只通过
+「语义事件 / 命令 / 模型读取」交互，且 Sequencer / Pattern / Track / Transport 中**不出现任何
+EuroPi API 调用**（换平台只需重写 Hardware 适配器）。模块映射如下：
+
+- Hardware Adapter  → `Hardware`：唯一访问 oled/k1/k2/b1/b2/cv*/din 的模块（硬件抽象）。
+- Input Manager    → `InputManager`：硬件状态 → 语义事件 `KnobTurn` / `ButtonEvent`（不改状态）。
+- 语义事件         → `KnobTurn`、`ButtonEvent`（含 `__slots__` 复用单例，避免每轮分配）。
+- Controller       → `Euclidean2`：事件分发 `dispatch()` + 命令派发 + 触发渲染（几乎无业务）。
+- UI Pages         → `Euclidean2._on_knob1/_on_knob2/_edit_global/_edit_channel/_apply_pickup`：
+                     把交互译为命令，只调用 `Transport` / `Track` 的设置器。
+- ApplicationState → `AppState`：仅 UI 状态（page / sel / k2 拾取 / dirty）。
+- Sequencer Core：
+    * `EuclidPattern`：Pattern（单个发生器的音乐内容 steps/pulses/rot/prob + pattern[]，不含播放头）。
+    * `Track`：TrackSettings(merge) + TrackPlayer(g1_pos/g2_pos 播放头 + out_reg 移位寄存器)。
+      即一个通道 = 双 Pattern + TrackSettings + TrackPlayer。输出电压为全局项，见 `Transport.level`。
+    * `Sequencer`：接收 ClockTick → 分发给各 `Track.output()` → 经 Hardware 输出 CV/Gate。
+- Transport        → `Transport`：全局时间（BPM / 倍率 mul / 输出电压 level / 时钟源 INT|EXT / 运行状态），实际时钟 = BPM×mul，INT 用内部 Timer，
+                      EXT 由 din 上升沿经 `ext_tick` 驱动。
+- Renderer         → `Renderer`：无状态，每次 `render(app, seq, transport, hw)` 读模型并经 Hardware 绘制，
+                      不修改、不持有持久 UI 数据。
+
+数据流：硬件 → Hardware → InputManager(事件) → Controller →
+        [UI Pages 命令 → Transport/Track]  /  [ClockTick → Sequencer → 输出事件 → Hardware]；
+        渲染在 `app.dirty` 时由 Controller 调用 `Renderer.render()`。
+
+状态持久化仍由 `SAVE_STATES` 常量控制（默认 False，完全屏蔽写盘/加载）；开启后行为同下文章节 9.8。
+以下「一、…九、」规范的所有音乐/UI 行为在重构后保持不变。
+
 一、硬件定义
 1. 输出：6路独立CV/GATE输出，每一路绑定一组独立双欧几里得发生器(Gen1+Gen2)，通道间完全独立互不影响
 2. 按键：B1、B2 为页面切换按键，循环切换编辑页面
 3. 旋钮：K1 参数选择旋钮(跳转策略)，K2 参数数值调节旋钮(拾取跟随策略)
 4. 屏幕：分辨率128×32单色屏
-5. 时钟系统：支持内部时钟、外部时钟双模式，内部时钟可自定义BPM
+5. 时钟系统：支持内部时钟、外部时钟双模式，内部时钟可自定义BPM与时钟倍率mul
 
 二、页面切换顺序
 全局时钟页(编号0) → CH1编辑页 → CH2编辑页 → CH3编辑页 → CH4编辑页 → CH5编辑页 → CH6编辑页 → 循环
 
 三、全局时钟页功能
 1. 参数1：时钟源选择（内部时钟 / 外部时钟）
-2. 参数2：内部时钟BPM数值调节
-3. 全局时钟统一驱动全部6路音序运行时序
+2. 参数2：内部时钟BPM数值调节（20–240）
+3. 参数3：时钟倍率mul数值调节（1–16），实际时钟 = BPM × mul（默认BPM=120, mul=4 → 480）
+4. 全局时钟统一驱动全部6路音序运行时序
 
 四、单通道可编辑全部参数（K1遍历列表），显示时要使用缩写
 -  Gen1 Rotate 相位旋转值
@@ -26,7 +57,8 @@
 -  Gen1 Prob 触发保留概率
 -  Gen2 Prob 触发保留概率
 -  双序列合并逻辑模式
--  通道CV输出电平
+
+（输出电压为全局设置项，于全局时钟页调节，不在此通道参数列表中。）
 
 五、旋钮交互规则
 1. K1 跳转策略：旋转直接顺序跳转选中参数，无缓冲无过渡，参数索引随旋钮档位即时变化；
@@ -79,8 +111,8 @@
 - 一/二（6 路独立双发生器 + 页面顺序）：可行。每通道绑定 (Gen1,Gen2) 各一组参数，
   合并后写入 cv[x]，通道间互不影响，与硬件 6 路输出一一对应。
 - 三（全局时钟页）：可行。外部时钟用 din.handler 上升沿驱动；内部时钟用
-  machine.Timer 周期回调驱动（周期 = 60000/BPM ms）。
-- 四（单通道 10 项参数）：可行，但 K1 直接映射到 10 档需在代码内用 k1.read_position(10)。
+  machine.Timer 周期回调驱动（周期 = 60000/(BPM×mul) ms）。
+- 四（单通道 9 项参数）：可行，但 K1 直接映射到 9 档需在代码内用 k1.read_position(9)。
 - 五（K1 跳转 / K2 拾取）：可行，但“无缓冲直接切换”与“拾取匹配”二处需补充判定细则（见 9.3）。
 - 六（128×32 UI）：方向正确，但格式需压缩（见 9.5），且 16 步可视 + 横向滚动需补充滚动触发方式。
 - 七（Björklund→旋转→概率→对齐→合并）：完全可行，算法与现有 euclid.py 一致可复用。
@@ -110,9 +142,10 @@
 - 合并语义对齐 Elektron Digitakt 2 的“双机器(Dual Machine)”：Gen1、Gen2 是两个独立
   发生器，各自有 steps/pulses/rot/prob；二者在每一步通过合并逻辑(OR/AND/XOR/GEN1/GEN2)
   实时得到该通道最终输出。GEN1/GEN2 模式即只取其中一路，等效旁路合并。
-- 该通道唯一插孔在 ON 时输出“通道 CV 输出电平”，OFF 时输出 0V。
-  实现：ON → cv[x].voltage(通道电平)；OFF → cv[x].off()。
-  即“通道CV输出电平”本质是自定义门高电压（替代默认 5V gate），取值范围 0~10V，默认 5V。
+- 该通道唯一插孔在 ON 时输出“全局输出电压”，OFF 时输出 0V。
+  实现：ON → cv[x].voltage(全局电平)；OFF → cv[x].off()。
+  即“全局输出电压”本质是自定义门高电压（替代默认 5V gate），取值范围 0~10V，默认 5V，
+  由全局时钟页统一设置，作用于全部 6 路。
 - 因此本模块每通道 = 一个受合并逻辑调制的门，门高电平可调；不提供第二个独立 CV 输出。
 - 建议文档明确：若用户需要“门 + 独立音高 CV”双信号，需占用两个通道（CHn.Gen 作门、
   另一通道设为常量电平），本规范不内置该模式。
@@ -122,11 +155,11 @@
 - 整屏 4 行（y=0/8/16/24），8×8 字。
 - 行0 状态栏（≤16 字符）：采用紧凑格式
   `P{page} {参数缩写}:{值}`（去掉 C{ch}；合并模式仅在 K1 选中 MERG 参数时显示于行0）
-  例：`P3 ROT1:5` / `P0 CLK INT` / `P0 BPM:120`
+  例：`P3 ROT1:5` / `P0 CLK INT` / `P0 BPM:120` / `P0 MUL:4`
   参数名缩写表（统一 4 字符，可读性优先；顺序即 K1 遍历顺序，按发生器分组）：
   ROT1=Gen1 Rotate, PLS1=Gen1 Pulses, STP1=Gen1 Steps, ROT2=Gen2 Rotate,
   PLS2=Gen2 Pulses, STP2=Gen2 Steps, PRB1=Gen1 Prob, PRB2=Gen2 Prob,
-  MERG=合并模式, LEVL=通道CV输出电平。
+  MERG=合并模式（输出电压为全局项，缩写 LVL 仅用于全局时钟页）。
 - 全局时钟页（P0）**只绘制行0 顶栏**，其余三行留空（不显示 CLK:/BPM:/提示行）。
 - 行1 显示 Gen1 原始序列（实心块=触发，2×2 点=空步）。
 - 行2 显示 Gen2 原始序列。
@@ -146,8 +179,9 @@
 
 9.6 全局时钟页布局与数值补充
 ----------------------------------------------------------------
-- 内部 BPM 范围建议 20~240，默认 120；外部时钟时 BPM 项置灰/显示“EXT”。
-- 时钟源 2 选 1（INT/EXT），由 K2 拾取切换。
+- 内部 BPM 范围建议 20~240，默认 120；时钟倍率 mul 范围 1~16，默认 4；实际时钟 = BPM × mul。
+  外部时钟时 BPM/mul 项置灰/显示“EXT”。
+- 全局时钟页 3 项参数：参数1 时钟源(INT/EXT，K2 拾取切换)、参数2 BPM、参数3 倍率 mul。
 - 门长统一为 GATE_MS=5ms：无论 INT/EXT/手动触发，均在置位输出后用 one-shot Timer(5ms)
   统一拉低所有 CV（turn_off_all_cvs），不再随周期变化，也不再由外部下降沿关闭门。
 - 内部时钟与外部时钟、手动触发共用同一置位+定时拉低逻辑（见 9.13），保证门宽一致。
@@ -159,7 +193,7 @@
 
 9.8 状态持久化（规范未提及，建议补充）
 ----------------------------------------------------------------
-- 每通道 steps/pulses/rot/prob/merge/level 及全局时钟源/BPM 应保存到本模块 state 文件
+- 每通道 steps/pulses/rot/prob/merge 及全局时钟源/BPM/倍率 mul/输出电压 应保存到本模块 state 文件
   （如 euclidean2.json），启动 main() 时加载，避免断电丢失。可复用 EuroPiScript 的
   _state_filename 机制或自行 JSON 存取。
 
@@ -180,7 +214,7 @@
 ----------------------------------------------------------------
 - 时钟驱动走事件而非轮询：
   * 外部时钟：din.handler(上升沿) 触发 6 通道同步 advance（置位输出，并由 one-shot Timer 5ms 后拉低）。
-  * 内部时钟：machine.Timer 周期回调中 advance（周期 = 60000/BPM ms），
+  * 内部时钟：machine.Timer 周期回调中 advance（周期 = 60000/(BPM×mul) ms），
     同样置位输出并由复用的 one-shot Timer 在 GATE_MS=5ms 后统一拉低所有门，不阻塞主循环。
   * 已移除 din.handler_falling：外部门宽统一为 5ms，与外部输入宽度无关。
 - 旋钮不空转计算：K1 选中参数仅在“档位跨越阈值”时切换参数项；K2 仅在已拾取后，
@@ -200,7 +234,7 @@
 9.12 模块定位边界（明确范围）
 ----------------------------------------------------------------
 - 本模块是节奏 / GATE 音序器，不是音高 / CV 音序器：每通道单插孔、合并只决定 ON/OFF，
-  “通道CV输出电平”即门高电压（0~10V，默认 5V）。如需每步输出音高，需另做量化映射，不在本规范。
+  “全局输出电压”即门高电压（0~10V，默认 5V），于全局时钟页统一设置。如需每步输出音高，需另做量化映射，不在本规范。
 
 9.13 内部时钟 Timer 资源（避免泄漏）
 ----------------------------------------------------------------
@@ -213,7 +247,7 @@
 ----------------------------------------------------------------
 - 全局时钟页切换“时钟源(INT/EXT)”时即时生效：选 INT → 启动周期 Timer；选 EXT → 停止 Timer
   并改由 din.handler 驱动。切换瞬间不丢拍：保留各通道 position，仅更换驱动源。
-- 外部时钟时 BPM 项显示“EXT”，K2 调 BPM 无效（置灰）。
+- BPM/倍率 mul 在 EXT 模式下也可由 K2 预调（值被保存，切回 INT 后立即生效）。
 
 9.15 长按检测机制
 ----------------------------------------------------------------

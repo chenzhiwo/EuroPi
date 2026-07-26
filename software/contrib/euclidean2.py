@@ -27,14 +27,16 @@ Euclidean2 - 6-channel dual Euclidean sequencer (Digitakt 2 style dual machine)
   K2            参数数值调节（拾取策略：旋钮位置匹配当前值后才生效）
 
 时钟：
-  全局页可切换 内部时钟(INT, 可调 BPM) / 外部时钟(EXT, DIN 上升沿驱动)
+  全局页可切换 内部时钟(INT, 可调 BPM 与倍率 mul) / 外部时钟(EXT, DIN 上升沿驱动)
+  实际时钟速率 = BPM x mul（如 BPM=120, mul=4 → 480 BPM 实际节拍）
 
 页面：
-  P0 全局时钟  ->  P1..P6 各通道编辑页  ->  循环
-  每通道 10 项参数（K1 遍历）：
+  P0 全局时钟(K1 切换: 时钟源 / BPM / 倍率mul / 输出电压)  ->  P1..P6 各通道编辑页  ->  循环
+  每通道 9 项参数（K1 遍历）：
     ROT1 Gen1旋转  ROT2 Gen2旋转  PLS1 Gen1脉冲  PLS2 Gen2脉冲
     STP1 Gen1步数  STP2 Gen2步数  PRB1 Gen1概率  PRB2 Gen2概率
-    MERG 合并模式  LEVL 通道CV输出电平
+    MERG 合并模式
+  （输出电压为全局设置项，于 P0 调节，默认 5V，作用全部 6 路）
 
 UI（128x32）：
   行0 状态栏  P{page} {缩写}:{值}（全局页 P0 仅显示此行）
@@ -42,7 +44,39 @@ UI（128x32）：
   行2 Gen2 序列，同左锚定前瞻滚动窗（最多 16 步，超出按播放头左滚）
   行3 合并结果序列（移位寄存器 out_reg，长度 = min(16, 最短序列)）
 
-基于 europi_hardware.py / europi.py 实机定义实现。
+--------------------------------------------------------------------------------
+单文件分层架构（参照 europi-ws/ARCHITECTURE.md 的亮点，受"保持单文件"约束）
+--------------------------------------------------------------------------------
+本文件刻意保持为**单个脚本**，但内部按 ARCHITECTURE.md 的架构原则严格分层，
+各层之间只通过「语义事件 / 命令 / 模型读取」交互，不直接互相改状态：
+
+    EuroPi 硬件
+        │
+        ▼
+    Hardware          ← 唯一允许调用 EuroPi API 的模块（硬件抽象）
+        │
+        ▼
+    InputManager      ← 硬件状态 → 语义事件 (KnobTurn / ButtonEvent)
+        │
+        ▼
+    Controller         ← Euclidean2：事件分发 + 命令派发 + 触发渲染（几乎无业务）
+        ├─→ UI Pages   ← 把交互译为命令（只调用 Transport / Track 的设置器）
+        ├─→ AppState   ← 仅 UI 状态（当前页 / 选中项 / K2 拾取）
+        ├─→ Sequencer  ← 拥有演奏：接收 ClockTick → 分发给各 Track → 输出事件
+        │      ├─ EuclidPattern  ← Pattern：单个发生器的音乐内容 (what)
+        │      └─ Track          ← TrackSettings + TrackPlayer（每通道运行时）
+        └─→ Transport   ← 拥有全局时间：BPM / 时钟源 / 运行状态 (when)
+        │
+        ▼
+    Renderer           ← 无状态渲染：读 AppState + Sequencer/Transport，经 Hardware 绘制
+
+关键约束（来自 ARCHITECTURE.md）：
+  * Sequencer / Pattern / Track / Transport 绝不出现 oled/k1/cv1 等 EuroPi 调用；
+    它们只产生语义输出（如 hw.set_cv(idx, v)），由 Hardware 适配器落盘到硬件。
+  * Renderer 是无状态的纯函数：只读模型、不修改、不持有持久 UI 数据。
+  * 单一事实来源：Pattern 是音乐数据唯一来源，Transport 是时间唯一来源，
+    AppState 是 UI 状态唯一来源；不跨层复制信息。
+  * 换平台只需重写 Hardware 适配器，其余层保持不变。
 """
 
 try:
@@ -90,12 +124,17 @@ from utime import ticks_diff, ticks_ms
 SAVE_STATES = False
 
 
+# ---------------------------------------------------------------------------
+# 配置与纯函数（与硬件无关）
+# ---------------------------------------------------------------------------
+
 # 合并模式（对齐 Digitakt 2 双机器）
 MERGE_MODES = ["OR", "AND", "XOR", "G1", "G2"]
 MERGE_OR, MERGE_AND, MERGE_XOR, MERGE_G1, MERGE_G2 = range(5)
 
 
 def combine_outputs(on1, on2, mode):
+    """合并两路触发，得到该通道本步 ON/OFF（纯函数，无副作用）。"""
     if mode == MERGE_OR:
         return on1 or on2
     if mode == MERGE_AND:
@@ -105,6 +144,7 @@ def combine_outputs(on1, on2, mode):
     if mode == MERGE_G1:
         return on1
     return on2
+
 
 # 通道参数顺序（K1 遍历），(缩写, 内部kind)，缩写统一 4 字符便于顶栏阅读
 CH_PARAMS = [
@@ -117,34 +157,181 @@ CH_PARAMS = [
     ("PRB1", "prob1"),
     ("PRB2", "prob2"),
     ("MERG", "merge"),
-    ("LEVL", "level"),
 ]
 
 NUM_PAGES = 7  # 0 全局 + 1..6 通道
 
 MIN_BPM = 20
 MAX_BPM = 240
+MIN_MUL = 1
+MAX_MUL = 16  # 时钟倍率（实际时钟 = BPM x mul）
 MAX_STEPS = 64  # 单发生器序列最大步数
 GATE_MS = 5  # 时钟事件后统一拉低输出的延迟（ms）
 K2_DEBOUNCE_MS = 40  # K2 数值提交消抖窗口（ms）
 
 
-class Gen:
-    """单路欧几里得发生器：Björklund 生成 + 旋转，概率仅在触发时判定。"""
+# ---------------------------------------------------------------------------
+# 语义事件（InputManager → Controller 的通信载体）
+# ---------------------------------------------------------------------------
+
+class KnobTurn:
+    """K1/K2 当前位置事件；复用单例对象避免每轮分配。"""
+    __slots__ = ("knob", "value")
+
+    def __init__(self, knob, value):
+        self.knob = knob
+        self.value = value
+
+
+class ButtonEvent:
+    """按钮语义事件：button ∈ {"B1","B2"}，kind ∈ {"press","long"}。"""
+    __slots__ = ("button", "kind")
+
+    def __init__(self, button, kind):
+        self.button = button
+        self.kind = kind
+
+
+# ---------------------------------------------------------------------------
+# Hardware Adapter —— 唯一允许访问 EuroPi 硬件 API 的模块（硬件抽象）
+# ---------------------------------------------------------------------------
+
+class Hardware:
+    """Hardware Adapter：集中所有 oled/k1/k2/b1/b2/cv*/din 调用。
+    其余模块只与本适配器交互，永不直接调用 EuroPi。换平台只改这里。"""
+
+    def __init__(self):
+        self.oled = oled
+        self.k1 = k1
+        self.k2 = k2
+        self.b1 = b1
+        self.b2 = b2
+        self.cv = [cv1, cv2, cv3, cv4, cv5, cv6]
+        self.din = din
+
+    # --- 输入读取 ---
+    def knob1(self):
+        return self.k1.percent()
+
+    def knob2(self):
+        return self.k2.percent()
+
+    def button1(self):
+        return self.b1.value() == HIGH
+
+    def button2(self):
+        return self.b2.value() == HIGH
+
+    def on_clock_rise(self, cb):
+        # 注册 DIN 上升沿回调（外部时钟源时由 Transport 驱动）
+        self.din.handler(cb)
+
+    # --- CV / Gate 输出（输出事件的落点）---
+    def set_cv(self, idx, voltage):
+        self.cv[idx].voltage(voltage)
+
+    def off_cv(self, idx):
+        self.cv[idx].off()
+
+    def off_all_cvs(self):
+        turn_off_all_cvs()
+
+    # --- 显示（Renderer 经此绘制，不直接碰 oled）---
+    def display_clear(self):
+        self.oled.fill(0)
+
+    def display_show(self):
+        self.oled.show()
+
+    def display_text(self, s, x, y):
+        self.oled.text(s, x, y, 1)
+
+    def display_fill_rect(self, x, y, w, h, c):
+        self.oled.fill_rect(x, y, w, h, c)
+
+
+# ---------------------------------------------------------------------------
+# Input Manager —— 硬件状态 → 语义事件
+# ---------------------------------------------------------------------------
+
+class InputManager:
+    """把硬件状态转化为语义事件（KnobTurn / ButtonEvent）。
+    不修改任何应用状态；按钮做短按/长按边沿判定。"""
+
+    def __init__(self, hw):
+        self.hw = hw
+        self._b1_down = False
+        self._b2_down = False
+        self._b1_press_t = 0
+        self._b2_press_t = 0
+        self._b1_long = False
+        self._b2_long = False
+        # 复用单例事件对象，避免每轮分配
+        self._knob1 = KnobTurn(1, 0.0)
+        self._knob2 = KnobTurn(2, 0.0)
+
+    def poll(self):
+        events = []
+        now = ticks_ms()
+        d1 = self.hw.button1()
+        d2 = self.hw.button2()
+
+        if d1 and d2:
+            # 双按 = 返回菜单（交由系统处理），本管理器不产出事件
+            self._b1_down = d1
+            self._b2_down = d2
+            return events
+
+        # B1
+        if d1 and not self._b1_down:
+            self._b1_press_t = now
+            self._b1_long = False
+        if d1 and not self._b1_long and ticks_diff(now, self._b1_press_t) >= 500:
+            self._b1_long = True
+            events.append(ButtonEvent("B1", "long"))
+        if not d1 and self._b1_down:
+            if not self._b1_long:
+                events.append(ButtonEvent("B1", "press"))
+        self._b1_down = d1
+
+        # B2
+        if d2 and not self._b2_down:
+            self._b2_press_t = now
+            self._b2_long = False
+        if d2 and not self._b2_long and ticks_diff(now, self._b2_press_t) >= 500:
+            self._b2_long = True
+            events.append(ButtonEvent("B2", "long"))
+        if not d2 and self._b2_down:
+            if not self._b2_long:
+                events.append(ButtonEvent("B2", "press"))
+        self._b2_down = d2
+
+        # 旋钮：每轮上报当前位置（页面层据其解释）
+        self._knob1.value = self.hw.knob1()
+        self._knob2.value = self.hw.knob2()
+        events.append(self._knob1)
+        events.append(self._knob2)
+        return events
+
+
+# ---------------------------------------------------------------------------
+# Sequencer Core —— Pattern / TrackPlayer / Sequencer（不含任何硬件调用）
+# ---------------------------------------------------------------------------
+
+class EuclidPattern:
+    """Pattern：单个欧几里得发生器的音乐内容（what to play）。
+    不含运行时播放头（pos 由 TrackPlayer / Track 持有）。"""
 
     def __init__(self, steps, pulses, rot, prob):
         self.steps = steps
         self.pulses = pulses
         self.rot = rot
         self.prob = prob
-        self.pos = steps - 1  # 首次 advance 后落于 0
         self.pattern = []
         self.regenerate()
 
     def regenerate(self):
         self.pattern = generate_euclidean_pattern(self.steps, self.pulses, self.rot)
-        if self.pos >= self.steps:
-            self.pos %= self.steps
 
     def set_steps(self, steps):
         self.steps = steps
@@ -166,31 +353,42 @@ class Gen:
         # 概率不影响存储序列，仅触发时判定，无需 regenerate
         self.prob = min(max(prob, 0), 100)
 
-    def advance(self):
-        self.pos = (self.pos + 1) % self.steps
 
-    def active(self):
-        """当前播放头步是否应触发（pattern 且通过概率保留判定）。"""
-        if not self.pattern[self.pos]:
-            return False
-        if self.prob >= 100:
-            return True
-        if self.prob <= 0:
-            return False
-        return random.random() < self.prob / 100.0
+class Track:
+    """Track = Pattern × 2 + TrackSettings + TrackPlayer（一个通道）。
+    - Pattern:    g1 / g2 的欧几里得序列（steps/pulses/rot/prob + pattern[]）
+    - TrackSettings: merge（输出电压为全局项，见 Transport.level）
+    - TrackPlayer:  g1_pos / g2_pos 播放头 + out_reg 移位寄存器输出序列
+    """
 
-
-class Channel:
-    """一个通道：双发生器 + 合并模式 + 输出电平 + 移位寄存器式输出序列。"""
-
-    def __init__(self, cv, g1, g2, merge, level):
-        self.cv = cv
+    def __init__(self, cv_index, g1, g2, merge):
+        self.cv_index = cv_index
         self.g1 = g1
         self.g2 = g2
         self.merge = merge
-        self.level = level
+        self.g1_pos = g1.steps - 1  # 首次 advance 后落于 0
+        self.g2_pos = g2.steps - 1
+        self.out_reg = []
         self.rebuild_reg()
 
+    # —— TrackSettings 命令（由 UI 页译为命令后调用）——
+    def set_gen(self, which, attr, val):
+        g = self.g1 if which == 1 else self.g2
+        if attr == "steps":
+            g.set_steps(val)
+        elif attr == "pulses":
+            g.set_pulses(val)
+        elif attr == "rot":
+            g.set_rot(val)
+        elif attr == "prob":
+            g.set_prob(val)
+        self.rebuild_reg()
+
+    def set_merge(self, val):
+        self.merge = val
+        self.rebuild_reg()
+
+    # —— TrackPlayer 运行时 ——
     def reg_len(self):
         return min(16, min(self.g1.steps, self.g2.steps))
 
@@ -200,140 +398,131 @@ class Channel:
         m = min(self.g1.steps, self.g2.steps)
         self.out_reg = []
         for i in range(n):
-            idx = (self.g1.pos + i) % m
+            idx = (self.g1_pos + i) % m
             self.out_reg.append(
                 combine_outputs(self.g1.pattern[idx], self.g2.pattern[idx], self.merge)
             )
 
+    def _active(self, gen, pos):
+        """该播放头步是否应触发（pattern 且通过概率保留判定）。"""
+        if not gen.pattern[pos]:
+            return False
+        if gen.prob >= 100:
+            return True
+        if gen.prob <= 0:
+            return False
+        return random.random() < gen.prob / 100.0
+
     def output(self):
-        # 先推进播放头，再对当前步做合并与概率运算
-        self.g1.advance()
-        self.g2.advance()
-        on1 = self.g1.active()
-        on2 = self.g2.active()
+        """推进一拍：两路播放头前进，按合并+概率计算 ON/OFF，并滚动输出序列。
+        返回该通道本拍是否触发（True/False）；由调用方翻译为 CV/Gate 输出事件。"""
+        self.g1_pos = (self.g1_pos + 1) % self.g1.steps
+        self.g2_pos = (self.g2_pos + 1) % self.g2.steps
+        on1 = self._active(self.g1, self.g1_pos)
+        on2 = self._active(self.g2, self.g2_pos)
         out = combine_outputs(on1, on2, self.merge)
-        if out:
-            self.cv.voltage(self.level)
-        else:
-            self.cv.off()
         # 移位寄存器一步操作：左端取出（已播放），右侧按输入序列压入新值
         if self.out_reg:
             n = len(self.out_reg)
             m = min(self.g1.steps, self.g2.steps)
-            idx = (self.g1.pos + (n - 1)) % m
+            idx = (self.g1_pos + (n - 1)) % m
             new_val = combine_outputs(
                 self.g1.pattern[idx], self.g2.pattern[idx], self.merge
             )
             self.out_reg.pop(0)
             self.out_reg.append(new_val)
+        return out
 
 
-class Euclidean2(EuroPiScript):
-    @classmethod
-    def display_name(cls):
-        return "Euclid2 6ch"
+class Sequencer:
+    """Sequencer：拥有演奏。接收 ClockTick（来自 Transport），分发给各 TrackPlayer，
+    并将结果翻译为 CV/Gate 输出事件，经 Hardware Adapter 应用到物理输出。
+    自身不接触任何 EuroPi API。"""
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, hw, transport):
+        self.hw = hw
+        self.transport = transport
+        self.tracks = []
+        self._gate_timer = machine.Timer()
 
-        self.source = "INT"
-        self.bpm = 120
+    def add_track(self, track):
+        self.tracks.append(track)
 
-        cv_list = [cv1, cv2, cv3, cv4, cv5, cv6]
-        self.channels = []
-        for i in range(6):
-            # 给不同通道一点差异化的默认节奏
-            g1 = Gen(16, 5, 0, 100)
-            g2 = Gen(16, 3, (i * 2) % 16, 100)
-            ch = Channel(cv_list[i], g1, g2, MERGE_OR, 5)
-            self.channels.append(ch)
-
-        self.page = 0
-        self.sel = 0
-        self.k2_picked = False
-        self.k2_pending = None  # 消抖候选值
-        self.k2_pending_t = 0  # 候选值首次出现时刻
-        self.dirty = True
-        self._dirty_save = False
-
-        # 按钮边沿状态（用于短按/长按判定）
-        self.b1_down = False
-        self.b2_down = False
-        self.b1_press_t = 0
-        self.b2_press_t = 0
-        self.b1_long = False
-        self.b2_long = False
-
-        # 时钟：一个周期 Timer 驱动 tick；一个复用的 one-shot Timer 关门（9.13）
-        # 用软件定时器 (Timer())，避免硬件 Timer ID 在本固件不可用
-        self.clock_timer = machine.Timer()
-        self.gate_timer = machine.Timer()
-        self.clock_running = False
-
-        if SAVE_STATES:
-            self.load_state()
-
-        @din.handler
-        def on_clock_rise():
-            if self.source == "EXT":
-                self._fire()
-
-        if self.source == "INT":
-            self._start_clock()
-        else:
-            self._stop_clock()
-
-    # ---------------- 时钟 ----------------
-    def beat_ms(self):
-        return max(1, 60000 // self.bpm)
-
-    def _tick(self, t=None):
-        # 时钟事件：先置位各通道输出，再用 one-shot 定时器在 GATE_MS 后统一拉低
-        for ch in self.channels:
-            ch.output()
-        self._schedule_gate_off()
-        self.dirty = True
-
-    def _fire(self):
-        # 外部/手动触发与内部周期触发共用同一置位 + 定时拉低逻辑
-        self._tick()
-
-    def _schedule_gate_off(self):
-        self.gate_timer.init(
+    def tick(self):
+        """一个 ClockTick：推进全部通道并刷新门输出。"""
+        level = self.transport.level  # 全局输出电压
+        for t in self.tracks:
+            on = t.output()
+            if on:
+                self.hw.set_cv(t.cv_index, level)
+            else:
+                self.hw.off_cv(t.cv_index)
+        # 统一在 GATE_MS 后拉低所有门（输出事件 → Hardware Adapter）
+        self._gate_timer.init(
             period=GATE_MS,
             mode=machine.Timer.ONE_SHOT,
-            callback=self._gates_off_irq,
+            callback=self._gate_off,
         )
 
-    def _gates_off_irq(self, t=None):
-        self._gates_off()
+    def _gate_off(self, _=None):
+        self.hw.off_all_cvs()
 
-    def _gates_off(self):
-        turn_off_all_cvs()
 
-    def _start_clock(self):
-        if self.clock_running:
-            self.clock_timer.deinit()
-        self.clock_timer.init(
-            period=self.beat_ms(), mode=machine.Timer.PERIODIC, callback=self._tick
+# ---------------------------------------------------------------------------
+# Transport —— 拥有全局音乐时间（when）
+# ---------------------------------------------------------------------------
+
+class Transport:
+    """Transport：拥有全局时间（tempo / 时钟源 / 运行状态）。
+    INT 模式用内部 Timer 周期驱动 ClockTick；EXT 模式由 din 上升沿驱动。
+    不直接接触 OLED/按钮/旋钮；仅通过回调通知节拍。"""
+
+    def __init__(self, hw, on_tick):
+        self.hw = hw
+        self._on_tick = on_tick
+        self.bpm = 120
+        self.mul = 4  # 时钟倍率：实际时钟 = BPM x mul
+        self.level = 5  # 全局输出 CV 电平（0~10V）
+        self.source = "INT"
+        self.running = False
+        self._clock_timer = machine.Timer()
+
+    def beat_ms(self):
+        # 实际每拍间隔 = 60s / (BPM x mul)
+        eff = self.bpm * self.mul
+        return max(1, 60000 // eff)
+
+    def start(self):
+        if self.running:
+            self._clock_timer.deinit()
+        self._clock_timer.init(
+            period=self.beat_ms(),
+            mode=machine.Timer.PERIODIC,
+            callback=self._fire_tick,
         )
-        self.clock_running = True
+        self.running = True
 
-    def _stop_clock(self):
-        if self.clock_running:
-            self.clock_timer.deinit()
-            self.clock_running = False
-        self._gates_off()
+    def stop(self):
+        if self.running:
+            self._clock_timer.deinit()
+            self.running = False
+
+    def _fire_tick(self, _=None):
+        self._on_tick()
+
+    def ext_tick(self, t=None):
+        # 仅在外部时钟源时由 din 上升沿驱动（INT 时忽略）
+        if self.source == "EXT":
+            self._on_tick()
 
     def set_source(self, src):
         if src == self.source:
             return
         self.source = src
         if src == "INT":
-            self._start_clock()
+            self.start()
         else:
-            self._stop_clock()
-        self.on_changed()
+            self.stop()
 
     def set_bpm(self, bpm):
         bpm = min(max(bpm, MIN_BPM), MAX_BPM)
@@ -341,23 +530,43 @@ class Euclidean2(EuroPiScript):
             return
         self.bpm = bpm
         if self.source == "INT":
-            self._start_clock()  # 以新周期重启
-        self.on_changed()
+            self.start()  # 以新周期重启
 
-    def manual_advance(self):
-        self._fire()
+    def set_mul(self, mul):
+        mul = min(max(mul, MIN_MUL), MAX_MUL)
+        if mul == self.mul:
+            return
+        self.mul = mul
+        if self.source == "INT":
+            self.start()  # 以新周期重启
 
-    # ---------------- 页面 ----------------
+    def set_level(self, level):
+        self.level = min(max(level, 0), 10)
+
+
+# ---------------------------------------------------------------------------
+# Application State —— 仅 UI 状态（单一事实来源之一）
+# ---------------------------------------------------------------------------
+
+class AppState:
+    """ApplicationState：只保存 UI 状态。
+    不保存 Pattern 数据，也不保存播放状态（二者分别在 Pattern / TrackPlayer）。"""
+
+    def __init__(self):
+        self.page = 0
+        self.sel = 0
+        self.k2_picked = False
+        self.k2_pending = None
+        self.k2_pending_t = 0
+        self.dirty = True  # 显示需要重绘
+
     def _set_page(self, p):
         self.page = p
-        n = 2 if p == 0 else len(CH_PARAMS)
+        n = 4 if p == 0 else len(CH_PARAMS)  # P0：时钟源 / BPM / MUL / 输出电压
         if self.sel >= n:
             self.sel = n - 1
         self.k2_picked = False
         self.k2_pending = None
-        # 切换页面先清空整屏，避免残影
-        oled.fill(0)
-        oled.show()
         self.dirty = True
 
     def prev_page(self):
@@ -369,203 +578,254 @@ class Euclidean2(EuroPiScript):
     def goto_global(self):
         self._set_page(0)
 
-    # ---------------- 旋钮 ----------------
-    def handle_knob1(self):
-        n = 2 if self.page == 0 else len(CH_PARAMS)
-        p = k1.percent()
-        idx = int(p * n)  # 截断实现 ±0.5 档迟滞，防边界抖动
-        if idx >= n:
-            idx = n - 1
-        if idx != self.sel:
-            self.sel = idx
-            self.k2_picked = False
-            self.k2_pending = None
 
-    def k2_value(self, pmin, pmax):
-        return round(k2.percent() * (pmax - pmin)) + pmin
+# ---------------------------------------------------------------------------
+# Renderer —— 无状态渲染（读 AppState + Sequencer/Transport，经 Hardware 绘制）
+# ---------------------------------------------------------------------------
 
-    def apply_pickup(self, current, pmin, pmax, setter, discrete=False):
-        val = self.k2_value(pmin, pmax)
-        val = min(max(val, pmin), pmax)
-        tol = 0 if discrete else max(1, (pmax - pmin) // 32)
-        if not self.k2_picked:
-            if abs(val - current) <= tol:
-                self.k2_picked = True
-                self.k2_pending = None
-            return
-        if val == current:
-            self.k2_pending = None
-            return
-        # 消抖：目标值需在 K2_DEBOUNCE_MS 窗口内保持稳定（无跳变）才提交，
-        # 抑制 ADC 噪声导致的数值抖动/误触发
-        now = ticks_ms()
-        if val != self.k2_pending:
-            self.k2_pending = val
-            self.k2_pending_t = now
-            return
-        if ticks_diff(now, self.k2_pending_t) < K2_DEBOUNCE_MS:
-            return
-        setter(val)
-        self.on_changed()
-        self.k2_pending = None
+class Renderer:
+    """Renderer：无状态。每次 render() 重新读取模型计算 OLED 内容，
+    不修改任何状态，不持有持久 UI 数据。"""
 
-    def edit_global(self):
-        if self.sel == 0:  # 时钟源（离散）
-            val = 1 if k2.percent() > 0.5 else 0
-            cur = 0 if self.source == "INT" else 1
-            if not self.k2_picked:
-                if val == cur:
-                    self.k2_picked = True
-                return
-            if val != cur:
-                self.set_source("EXT" if val == 1 else "INT")
-                self.on_changed()
-        else:  # BPM
-            self.apply_pickup(self.bpm, MIN_BPM, MAX_BPM, self.set_bpm)
-
-    def _set_merge(self, ch, v):
-        ch.merge = v
-        self.on_changed()
-
-    def _set_level(self, ch, v):
-        ch.level = v
-        self.on_changed()
-
-    def edit_channel(self, ch):
-        kind = CH_PARAMS[self.sel][1]
-        if kind == "rot1":
-            self.apply_pickup(ch.g1.rot, 0, ch.g1.steps, lambda v: (ch.g1.set_rot(v), ch.rebuild_reg()))
-        elif kind == "rot2":
-            self.apply_pickup(ch.g2.rot, 0, ch.g2.steps, lambda v: (ch.g2.set_rot(v), ch.rebuild_reg()))
-        elif kind == "steps1":
-            self.apply_pickup(ch.g1.steps, 4, MAX_STEPS, lambda v: (ch.g1.set_steps(v), ch.rebuild_reg()))
-        elif kind == "steps2":
-            self.apply_pickup(ch.g2.steps, 4, MAX_STEPS, lambda v: (ch.g2.set_steps(v), ch.rebuild_reg()))
-        elif kind == "pulses1":
-            self.apply_pickup(ch.g1.pulses, 0, ch.g1.steps, lambda v: (ch.g1.set_pulses(v), ch.rebuild_reg()))
-        elif kind == "pulses2":
-            self.apply_pickup(ch.g2.pulses, 0, ch.g2.steps, lambda v: (ch.g2.set_pulses(v), ch.rebuild_reg()))
-        elif kind == "prob1":
-            self.apply_pickup(ch.g1.prob, 0, 100, ch.g1.set_prob)
-        elif kind == "prob2":
-            self.apply_pickup(ch.g2.prob, 0, 100, ch.g2.set_prob)
-        elif kind == "merge":
-            self.apply_pickup(
-                ch.merge, 0, 4, lambda v: (self._set_merge(ch, v), ch.rebuild_reg()), discrete=True
-            )
-        elif kind == "level":
-            self.apply_pickup(
-                ch.level, 0, 10, lambda v: self._set_level(ch, v)
-            )
-
-    # ---------------- 按钮（短按/长按；让出双按退出菜单） ----------------
-    def handle_buttons(self):
-        now = ticks_ms()
-        d1 = b1.value() == HIGH
-        d2 = b2.value() == HIGH
-        if d1 and d2:
-            # 双按 = 返回菜单，交给系统 both-handler，本脚本不处理
-            self.b1_down = d1
-            self.b2_down = d2
-            return
-
-        # B1
-        if d1 and not self.b1_down:
-            self.b1_press_t = now
-            self.b1_long = False
-        if d1 and not self.b1_long and ticks_diff(now, self.b1_press_t) >= 500:
-            self.b1_long = True
-            self.manual_advance()
-        if not d1 and self.b1_down:
-            if not self.b1_long:
-                self.prev_page()
-        self.b1_down = d1
-
-        # B2
-        if d2 and not self.b2_down:
-            self.b2_press_t = now
-            self.b2_long = False
-        if d2 and not self.b2_long and ticks_diff(now, self.b2_press_t) >= 500:
-            self.b2_long = True
-            self.goto_global()
-        if not d2 and self.b2_down:
-            if not self.b2_long:
-                self.next_page()
-        self.b2_down = d2
-
-    # ---------------- 显示 ----------------
-    def redraw(self):
-        oled.fill(0)
-        if self.page == 0:
-            self.draw_global()
+    def render(self, app, seq, transport, hw):
+        hw.display_clear()
+        if app.page == 0:
+            self._draw_global(app, transport, hw)
         else:
-            self.draw_channel(self.channels[self.page - 1])
-        oled.show()
+            self._draw_channel(app, seq.tracks[app.page - 1], hw)
+        hw.display_show()
 
-    def draw_global(self):
-        # 全局时钟页只显示顶栏（P0 CLK:.. 或 P0 BPM:..），其余行留空
-        if self.sel == 0:
-            oled.text(f"P0 CLK:{self.source}", 0, 0, 1)
+    def _draw_global(self, app, transport, hw):
+        # 全局时钟页只显示顶栏（P0 CLK:.. / P0 BPM:.. / P0 MUL:.. / P0 LVL:..），其余行留空
+        if app.sel == 0:
+            hw.display_text(f"P0 CLK:{transport.source}", 0, 0)
+        elif app.sel == 1:
+            hw.display_text(f"P0 BPM:{transport.bpm}", 0, 0)
+        elif app.sel == 2:
+            hw.display_text(f"P0 MUL:{transport.mul}", 0, 0)
         else:
-            oled.text(f"P0 BPM:{self.bpm}", 0, 0, 1)
+            hw.display_text(f"P0 LVL:{transport.level}V", 0, 0)
 
-    def _param_value(self, ch):
-        kind = CH_PARAMS[self.sel][1]
+    def _draw_channel(self, app, track, hw):
+        abbr, kind = CH_PARAMS[app.sel]
+        if kind == "merge":
+            val = MERGE_MODES[track.merge]
+        else:
+            val = self._param_value(track, kind)
+        hw.display_text(f"P{app.page} {abbr}:{val}", 0, 0)
+        self._draw_seq_row(track.g1, track.g1_pos, 8, hw)
+        self._draw_seq_row(track.g2, track.g2_pos, 16, hw)
+        self._draw_result_row(track, 24, hw)
+
+    def _param_value(self, track, kind):
         mapping = {
-            "rot1": ch.g1.rot,
-            "rot2": ch.g2.rot,
-            "steps1": ch.g1.steps,
-            "steps2": ch.g2.steps,
-            "pulses1": ch.g1.pulses,
-            "pulses2": ch.g2.pulses,
-            "prob1": ch.g1.prob,
-            "prob2": ch.g2.prob,
+            "rot1": track.g1.rot,
+            "rot2": track.g2.rot,
+            "steps1": track.g1.steps,
+            "steps2": track.g2.steps,
+            "pulses1": track.g1.pulses,
+            "pulses2": track.g2.pulses,
+            "prob1": track.g1.prob,
+            "prob2": track.g2.prob,
         }
         return mapping.get(kind, "")
 
-    def draw_channel(self, ch):
-        abbr, kind = CH_PARAMS[self.sel]
-        if kind == "merge":
-            val = MERGE_MODES[ch.merge]
-        elif kind == "level":
-            val = f"{ch.level}V"
-        else:
-            val = self._param_value(ch)
-        oled.text(f"P{self.page} {abbr}:{val}", 0, 0, 1)
-        self.draw_seq_row(ch.g1, 8)
-        self.draw_seq_row(ch.g2, 16)
-        self.draw_result_row(ch, 24)
-
-    def draw_seq_row(self, gen, y):
-        # 移位寄存器式滚动：当前步固定 col0，向右取至多 16 格；若序列步数 < 16 则只显示实际步数。
-        # 触发以实心块表示，不触发以一点(2x2)表示，无播放头标记
+    def _draw_seq_row(self, gen, pos, y, hw):
+        # 当前步固定 col0，向右取至多 16 格；序列步数 < 16 则只显示实际步数
         for i in range(min(16, gen.steps)):
-            idx = (gen.pos + i) % gen.steps
+            idx = (pos + i) % gen.steps
             x = i * 8
             if gen.pattern[idx]:
-                oled.fill_rect(x, y, 6, 6, 1)
+                hw.display_fill_rect(x, y, 6, 6, 1)
             else:
-                oled.fill_rect(x + 2, y + 2, 2, 2, 1)
+                hw.display_fill_rect(x + 2, y + 2, 2, 2, 1)
 
-    def draw_result_row(self, ch, y):
-        # 底行 = 移位寄存器风格的输出序列（ch.out_reg），长度 = min(16, 最短序列)
-        # 触发实心块、不触发一点(2x2)，无播放头标记
-        for i, on in enumerate(ch.out_reg):
+    def _draw_result_row(self, track, y, hw):
+        # 底行 = 移位寄存器风格的输出序列（track.out_reg），长度 = min(16, 最短序列)
+        for i, on in enumerate(track.out_reg):
             x = i * 8
             if on:
-                oled.fill_rect(x, y, 6, 6, 1)
+                hw.display_fill_rect(x, y, 6, 6, 1)
             else:
-                oled.fill_rect(x + 2, y + 2, 2, 2, 1)
+                hw.display_fill_rect(x + 2, y + 2, 2, 2, 1)
 
-    # ---------------- 状态持久化 ----------------
+
+# ---------------------------------------------------------------------------
+# Controller / Application —— 事件分发 + 命令派发 + 触发渲染（几乎无业务逻辑）
+# ---------------------------------------------------------------------------
+
+class Euclidean2(EuroPiScript):
+    @classmethod
+    def display_name(cls):
+        return "Euclid2 6ch"
+
+    def __init__(self):
+        super().__init__()
+
+        self.hw = Hardware()
+        self.app = AppState()
+        self.transport = Transport(self.hw, self._on_beat)
+        self.seq = Sequencer(self.hw, self.transport)
+
+        # 6 通道默认节奏（差异化）
+        for i in range(6):
+            g1 = EuclidPattern(16, 5, 0, 100)
+            g2 = EuclidPattern(16, 3, (i * 2) % 16, 100)
+            self.seq.add_track(Track(i, g1, g2, MERGE_OR))
+
+        self.input = InputManager(self.hw)
+        self.renderer = Renderer()
+        self._dirty_save = False
+
+        # 时钟输入：注册 din 回调；仅在 EXT 时由 Transport.ext_tick 驱动
+        self.hw.on_clock_rise(self.transport.ext_tick)
+        if SAVE_STATES:
+            self.load_state()
+        # 启动时钟（依据当前 source：默认 INT）
+        if self.transport.source == "INT":
+            self.transport.start()
+        else:
+            self.transport.stop()
+
+    # —— 节拍（ClockTick 事件）——
+    def _on_beat(self):
+        self.seq.tick()
+        self.app.dirty = True
+
+    def manual_advance(self):
+        self._on_beat()
+
+    # —— 事件分发（Controller 的职责之一）——
+    def dispatch(self, ev):
+        if isinstance(ev, KnobTurn):
+            if ev.knob == 1:
+                self._on_knob1(ev.value)
+            else:
+                self._on_knob2(ev.value)
+        elif isinstance(ev, ButtonEvent):
+            if ev.button == "B1":
+                if ev.kind == "long":
+                    self.manual_advance()
+                else:
+                    self.app.prev_page()
+            else:  # B2
+                if ev.kind == "long":
+                    self.app.goto_global()
+                else:
+                    self.app.next_page()
+
+    # —— UI Pages：把交互译为命令（只调用 Transport / Track 的设置器）——
+    def _on_knob1(self, p):
+        n = 4 if self.app.page == 0 else len(CH_PARAMS)
+        idx = int(p * n)  # 截断实现 ±0.5 档迟滞，防边界抖动
+        if idx >= n:
+            idx = n - 1
+        if idx != self.app.sel:
+            self.app.sel = idx
+            self.app.k2_picked = False
+            self.app.k2_pending = None
+
+    def _on_knob2(self, p):
+        if self.app.page == 0:
+            self._edit_global(p)
+        else:
+            self._edit_channel(self.seq.tracks[self.app.page - 1], p)
+
+    def _edit_global(self, p):
+        if self.app.sel == 0:  # 时钟源（离散）
+            val = 1 if p > 0.5 else 0
+            cur = 0 if self.transport.source == "INT" else 1
+            if not self.app.k2_picked:
+                if val == cur:
+                    self.app.k2_picked = True
+                return
+            if val == cur:
+                self.app.k2_pending = None
+                return
+            self.transport.set_source("EXT" if val == 1 else "INT")
+            self.on_changed()
+            self.app.k2_pending = None
+        elif self.app.sel == 1:  # BPM
+            self._apply_pickup(
+                self.transport.bpm, MIN_BPM, MAX_BPM, self.transport.set_bpm, p
+            )
+        elif self.app.sel == 2:  # mul（时钟倍率：实际时钟 = BPM x mul）
+            self._apply_pickup(
+                self.transport.mul, MIN_MUL, MAX_MUL, self.transport.set_mul, p
+            )
+        else:  # 输出电压（全局，0~10V）
+            self._apply_pickup(
+                self.transport.level, 0, 10, self.transport.set_level, p
+            )
+
+    def _edit_channel(self, track, p):
+        kind = CH_PARAMS[self.app.sel][1]
+        if kind == "rot1":
+            self._apply_pickup(track.g1.rot, 0, track.g1.steps,
+                               lambda v: track.set_gen(1, "rot", v), p)
+        elif kind == "rot2":
+            self._apply_pickup(track.g2.rot, 0, track.g2.steps,
+                               lambda v: track.set_gen(2, "rot", v), p)
+        elif kind == "steps1":
+            self._apply_pickup(track.g1.steps, 4, MAX_STEPS,
+                               lambda v: track.set_gen(1, "steps", v), p)
+        elif kind == "steps2":
+            self._apply_pickup(track.g2.steps, 4, MAX_STEPS,
+                               lambda v: track.set_gen(2, "steps", v), p)
+        elif kind == "pulses1":
+            self._apply_pickup(track.g1.pulses, 0, track.g1.steps,
+                               lambda v: track.set_gen(1, "pulses", v), p)
+        elif kind == "pulses2":
+            self._apply_pickup(track.g2.pulses, 0, track.g2.steps,
+                               lambda v: track.set_gen(2, "pulses", v), p)
+        elif kind == "prob1":
+            self._apply_pickup(track.g1.prob, 0, 100,
+                               lambda v: track.set_gen(1, "prob", v), p)
+        elif kind == "prob2":
+            self._apply_pickup(track.g2.prob, 0, 100,
+                               lambda v: track.set_gen(2, "prob", v), p)
+        elif kind == "merge":
+            self._apply_pickup(track.merge, 0, 4, track.set_merge, p, discrete=True)
+
+    def _apply_pickup(self, current, pmin, pmax, setter, p, discrete=False):
+        """K2 拾取策略：旋钮位置匹配当前值后才生效；提交前做 K2_DEBOUNCE_MS 消抖。"""
+        val = round(p * (pmax - pmin)) + pmin
+        val = min(max(val, pmin), pmax)
+        tol = 0 if discrete else max(1, (pmax - pmin) // 32)
+        if not self.app.k2_picked:
+            if abs(val - current) <= tol:
+                self.app.k2_picked = True
+                self.app.k2_pending = None
+            return
+        if val == current:
+            self.app.k2_pending = None
+            return
+        # 消抖：目标值需在 K2_DEBOUNCE_MS 窗口内保持稳定（无跳变）才提交
+        now = ticks_ms()
+        if val != self.app.k2_pending:
+            self.app.k2_pending = val
+            self.app.k2_pending_t = now
+            return
+        if ticks_diff(now, self.app.k2_pending_t) < K2_DEBOUNCE_MS:
+            return
+        setter(val)
+        self.on_changed()
+        self.app.k2_pending = None
+
+    # —— 状态持久化（受 SAVE_STATES 开关控制）——
     def on_changed(self):
-        self.dirty = True
+        self.app.dirty = True
         if SAVE_STATES:
             self._dirty_save = True
 
     def get_state(self):
         return {
-            "clock": {"source": self.source, "bpm": self.bpm},
+            "clock": {
+                "source": self.transport.source,
+                "bpm": self.transport.bpm,
+                "mul": self.transport.mul,
+                "level": self.transport.level,
+            },
             "channels": [
                 {
                     "g1": {
@@ -581,18 +841,19 @@ class Euclidean2(EuroPiScript):
                         "prob": c.g2.prob,
                     },
                     "merge": c.merge,
-                    "level": c.level,
                 }
-                for c in self.channels
+                for c in self.seq.tracks
             ],
         }
 
     def set_state(self, state):
         try:
             clk = state.get("clock", {})
-            self.source = clk.get("source", "INT")
-            self.bpm = clk.get("bpm", 120)
-            for i, c in enumerate(self.channels):
+            self.transport.source = clk.get("source", "INT")
+            self.transport.bpm = clk.get("bpm", 120)
+            self.transport.mul = clk.get("mul", 4)
+            self.transport.level = clk.get("level", 5)
+            for i, c in enumerate(self.seq.tracks):
                 d = (state.get("channels") or [])[i]
                 if d is None:
                     break
@@ -609,7 +870,6 @@ class Euclidean2(EuroPiScript):
                 c.g2.prob = g2["prob"]
                 c.g2.regenerate()
                 c.merge = d["merge"]
-                c.level = d["level"]
                 c.rebuild_reg()
         except Exception as e:
             print("Euclidean2: failed to load state:", e)
@@ -629,18 +889,14 @@ class Euclidean2(EuroPiScript):
         self.save_state_json(self.get_state())
         self._dirty_save = False
 
-    # ---------------- 主循环 ----------------
+    # —— 主循环 ——
     def main(self):
         while True:
-            self.handle_buttons()
-            self.handle_knob1()
-            if self.page == 0:
-                self.edit_global()
-            else:
-                self.edit_channel(self.channels[self.page - 1])
-            if self.dirty:
-                self.redraw()
-                self.dirty = False
+            for ev in self.input.poll():
+                self.dispatch(ev)
+            if self.app.dirty:
+                self.renderer.render(self.app, self.seq, self.transport, self.hw)
+                self.app.dirty = False
             self.save_state()
             time.sleep_ms(5)
 

@@ -5,7 +5,7 @@ EuroPi 上的 6 通道双欧几里得节奏/GATE 音序器，灵感来自 Elektr
 二者通过合并逻辑实时得到该通道最终的门信号。
 
 > 本模块是**节奏 / GATE 音序器**，不是音高 / CV 音序器：每通道只有一个插孔，
-> 合并结果只决定 ON/OFF，「通道 CV 输出电平」即门的触发高电压（0~10V，默认 5V）。
+> 合并结果只决定 ON/OFF，「全局输出电压」即门的触发高电压（0~10V，默认 5V），于 P0 设置并作用于全部 6 路。
 
 ## 硬件资源
 
@@ -35,10 +35,12 @@ P0 全局时钟 → P1 CH1 → P2 CH2 → P3 CH3 → P4 CH4 → P5 CH5 → P6 CH
 
 ### 全局时钟页 (P0)
 - 参数 1 时钟源：INT（内部时钟）/ EXT（外部时钟，DIN 驱动）
-- 参数 2 BPM：20–300，仅 INT 模式可调；EXT 模式显示 `EXT`
+- 参数 2 BPM：20–240，仅 INT 模式可调；EXT 模式显示 `EXT`
+- 参数 3 倍率 mul：1–16，实际时钟 = `BPM × mul`（默认 BPM=120, mul=4 → 480 BPM）
+- 参数 4 输出电压：0–10V，作用于全部 6 路（默认 5V）
 
 ### 通道编辑页 (P1..P6)
-每通道 10 项参数，由 K1 遍历（缩写显示在状态栏）：
+每通道 9 项参数，由 K1 遍历（缩写显示在状态栏）：
 
 | 缩写 | 参数 | 范围 |
 | --- | --- | --- |
@@ -51,7 +53,8 @@ P0 全局时钟 → P1 CH1 → P2 CH2 → P3 CH3 → P4 CH4 → P5 CH5 → P6 CH
 | B1 | Gen1 触发保留概率 | 0 ~ 100 |
 | B2 | Gen2 触发保留概率 | 0 ~ 100 |
 | MER | 合并模式 | OR / AND / XOR / G1 / G2 |
-| LVL | 通道 CV 输出电平 | 0 ~ 10 (V) |
+
+> 输出电压为**全局设置项**（见下方「全局时钟页 参数4」），作用于全部 6 路，不在通道页调节。
 
 ## 屏幕布局（128×32）
 
@@ -83,7 +86,7 @@ P0 全局时钟 → P1 CH1 → P2 CH2 → P3 CH3 → P4 CH4 → P5 CH5 → P6 CH
 
 ## 时钟
 
-- **内部时钟 (INT)**：由内部 Timer 周期驱动，周期 = `60000 / BPM` ms；门长按
+- **内部时钟 (INT)**：由内部 Timer 周期驱动，周期 = `60000 / (BPM × mul)` ms；门长按
   `min(周期/2, 30ms)` 自动关闭。
 - **外部时钟 (EXT)**：DIN 上升沿推进全部通道，下降沿关闭所有门（跟随输入门宽）。
 - 全局时钟统一驱动全部 6 路，通道间无独立分频/延迟（即「无 Shift 时序偏移」）；
@@ -91,8 +94,35 @@ P0 全局时钟 → P1 CH1 → P2 CH2 → P3 CH3 → P4 CH4 → P5 CH5 → P6 CH
 
 ## 状态保存
 
-所有参数（每通道 steps/pulses/rot/prob/merge/level，以及全局时钟源/BPM）自动保存到
-`saved_state_Euclidean2.txt`，断电或返回菜单后下次启动自动恢复。状态变更约 1 秒落盘一次。
+状态持久化由脚本顶部常量 `SAVE_STATES` 控制：
+
+- `SAVE_STATES = True`：所有参数（每通道 steps/pulses/rot/prob/merge，以及全局
+  时钟源/BPM/倍率 mul/输出电压）自动保存到 `saved_state_Euclidean2.txt`，断电或返回菜单后下次启动自动恢复；
+  状态变更约 1 秒落盘一次。
+- `SAVE_STATES = False`（当前默认）：完全屏蔽 save states 功能——既不从 flash 加载历史
+  状态（每次启动都用默认/初始参数），也不在运行中写盘，避免阻塞式写 flash 造成的卡顿。
+  需要保留参数时改回 `True`。
+
+## 内部架构（单文件分层，参照 ARCHITECTURE.md）
+
+代码保持为**单个文件**，但内部按 `europi-ws/ARCHITECTURE.md` 的原则严格分层；各层只通过
+「语义事件 / 命令 / 模型读取」交互，绝不直接互相改状态，且 Sequencer / Pattern / Track /
+Transport 中**不出现任何 EuroPi API 调用**：
+
+| 层 | 类 | 职责 | 单一事实来源 |
+| --- | --- | --- | --- |
+| Hardware Adapter | `Hardware` | 唯一访问 `oled/k1/k2/b1/b2/cv*/din` 的模块 | — |
+| Input Manager | `InputManager` | 硬件状态 → 语义事件（`KnobTurn` / `ButtonEvent`） | — |
+| Controller | `Euclidean2` | 事件分发 + 命令派发 + 触发渲染（几乎无业务） | — |
+| UI Pages | `Euclidean2._edit_*` / `_on_knob*` | 把交互译为命令，只调 Transport / Track 设置器 | — |
+| ApplicationState | `AppState` | 仅 UI 状态（当前页 / 选中项 / K2 拾取） | UI 状态 |
+| Sequencer Core | `EuclidPattern` / `Track` / `Sequencer` | `Pattern`=音乐内容；`Track`=TrackSettings+TrackPlayer；`Sequencer`=分发 ClockTick 并产出输出事件 | 音乐数据 |
+| Transport | `Transport` | 全局时间：BPM / 倍率 mul / 输出电压 level / 时钟源 / 运行状态 | 时间 |
+| Renderer | `Renderer` | 无状态：读模型、经 Hardware 绘制，不修改、不持有持久数据 | — |
+
+数据流：`硬件 → Hardware → InputManager(事件) → Controller → [UI Pages 命令 → Transport/Track] / [ClockTick → Sequencer → 输出事件 → Hardware]`；
+渲染由 Controller 在「脏」时调用 `Renderer.render(app, seq, transport, hw)`。
+换硬件平台只需重写 `Hardware` 适配器，其余层保持不变。
 
 ## 实现要点（对应 euclidean2_dev.md）
 
