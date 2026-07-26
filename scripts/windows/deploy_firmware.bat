@@ -1,11 +1,5 @@
-::FIRMWARE::
-set "deployfilepath=%~dp0"
-set "filepathfirmware=%deployfilepath%..\..\software\firmware\*.py"
-set "filepathrshell=%filepathfirmware:\=/%"
-set "filepathrshell=%filepathrshell:C:/=/%"
-dir "%filepathfirmware%"
-cd/
-rshell mkdir /pyboard/lib
-rshell cp %filepathrshell% /pyboard/lib/
-
-cd %~dp0
+@echo off
+:: FIRMWARE
+set "SRC=%~dp0..\..\software\firmware"
+mpremote fs mkdir :/lib
+for %%f in ("%SRC%\*.py") do mpremote fs cp "%%f" :/lib/
