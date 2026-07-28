@@ -61,13 +61,15 @@ UI（128x32）：
                           [KnobTurn, ButtonEvent, ClockEvent]（外部时钟亦走此队列）
         │
         ▼
-    Controller         ← Euclidean2：事件分发 + 命令派发 + 触发渲染（几乎无业务）
-        ├─→ UI Pages   ← 把交互译为命令（只调用 Transport / Track 的设置器）
+    Controller         ← Euclidean2：事件分发 + 命令派发（_exec 统一出口）+ 触发渲染
+        ├─→ 命令 Command ← 与输入侧事件对称的「输出载体」：SetBpm/SetTrackParam/…
+        │                  所有模型变更经 _exec(cmd) 执行（改模型 + 置 dirty）
+        ├─→ UI Pages   ← 把交互译为命令（产出 Command，不直改模型）
         ├─→ AppState   ← 仅 UI 状态（当前页 / 选中项 / K2 拾取）
         ├─→ Sequencer  ← 拥有演奏：接收 ClockTick → 分发给各 Track → 输出事件
-        │      ├─ EuclidPattern  ← Pattern：单个发生器的音乐内容 (what)
-        │      └─ Track          ← TrackSettings + TrackPlayer（每通道运行时）
-        └─→ Transport   ← 拥有全局时间：BPM / 时钟源 / 运行状态 (when)
+        │      ├─ EuclidPattern  ← Pattern：单个发生器的音乐内容 (what)；自管 to_dict/from_dict
+        │      └─ Track          ← TrackSettings + TrackPlayer；自管 to_dict/from_dict
+        └─→ Transport   ← 拥有全局时间：BPM / 时钟源 / 运行状态 (when)；自管 to_dict/from_dict
         │
         ▼
     Renderer           ← 无状态渲染：读 AppState + Sequencer/Transport，经 Hardware 绘制
@@ -201,6 +203,68 @@ class ClockEvent:
     """外部时钟 tick 事件（DIN 上升沿）。
     由 Hardware 的时钟队列流出，经 dispatch 驱动 Transport.ext_tick（仅 EXT 源生效）。"""
     __slots__ = ()
+
+
+# ---------------------------------------------------------------------------
+# 命令（Controller → Model 的通信载体，与输入侧事件对称）
+# 所有模型变更经 Controller._exec(cmd) 统一执行：执行即改模型 + 置 dirty。
+# 命令只携带「意图」（目标 + 值），不直接耦合 Controller；便于单测/录制。
+# ---------------------------------------------------------------------------
+
+class Command:
+    """命令基类：所有命令实现 execute() 完成对模型的变更。"""
+    def execute(self):
+        raise NotImplementedError
+
+
+class SetTransportSource(Command):
+    def __init__(self, transport, src):
+        self._t, self._v = transport, src
+
+    def execute(self):
+        self._t.set_source(self._v)
+
+
+class SetBpm(Command):
+    def __init__(self, transport, bpm):
+        self._t, self._v = transport, bpm
+
+    def execute(self):
+        self._t.set_bpm(self._v)
+
+
+class SetMul(Command):
+    def __init__(self, transport, mul):
+        self._t, self._v = transport, mul
+
+    def execute(self):
+        self._t.set_mul(self._v)
+
+
+class SetLevel(Command):
+    def __init__(self, transport, level):
+        self._t, self._v = transport, level
+
+    def execute(self):
+        self._t.set_level(self._v)
+
+
+class SetTrackParam(Command):
+    """通道发生器参数（steps/pulses/rot/prob）变更。"""
+    def __init__(self, track, which, attr, val):
+        self._t, self._w, self._a, self._v = track, which, attr, val
+
+    def execute(self):
+        self._t.set_gen(self._w, self._a, self._v)
+
+
+class SetMerge(Command):
+    """通道合并模式变更。"""
+    def __init__(self, track, val):
+        self._t, self._v = track, val
+
+    def execute(self):
+        self._t.set_merge(self._v)
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +497,21 @@ class EuclidPattern:
         # 概率不影响存储序列，仅触发时判定，无需 regenerate
         self.prob = min(max(prob, 0), 100)
 
+    # —— 序列化（模型自管，Controller 只做编排）——
+    def to_dict(self):
+        return {"steps": self.steps, "pulses": self.pulses,
+                "rot": self.rot, "prob": self.prob}
+
+    def from_dict(self, d):
+        if not d:
+            return
+        # 直接赋值（与原始 set_state 行为一致，不在此 clamp，交由上层保证存储合法）
+        self.steps = d.get("steps", self.steps)
+        self.pulses = d.get("pulses", self.pulses)
+        self.rot = d.get("rot", self.rot)
+        self.prob = d.get("prob", self.prob)
+        self.regenerate()  # 统一重算一次，消除「哪些字段需 regenerate」的隐式知识
+
 
 class Track:
     """Track = Pattern × 2 + TrackSettings + TrackPlayer（一个通道）。
@@ -487,24 +566,34 @@ class Track:
         self.last_out = out  # 记录当前步触发状态，供屏幕左下角指示
         return out
 
+    # —— 序列化（模型自管，Controller 只做编排）——
+    def to_dict(self):
+        return {"g1": self.g1.to_dict(), "g2": self.g2.to_dict(),
+                "merge": self.merge}
+
+    def from_dict(self, d):
+        if not d:
+            return
+        self.g1.from_dict(d.get("g1", {}))
+        self.g2.from_dict(d.get("g2", {}))
+        self.merge = d.get("merge", self.merge)
+
 
 class Sequencer:
     """Sequencer：拥有演奏。接收 ClockTick（来自 Transport），分发给各 TrackPlayer，
     并将结果翻译为 CV/Gate 输出事件，经 Hardware Adapter 应用到物理输出。
-    自身不接触任何 EuroPi API。"""
+    自身不接触任何 EuroPi API，也不依赖 Transport（电平由 tick(level) 传入）。"""
 
-    def __init__(self, hw, transport):
+    def __init__(self, hw):
         self.hw = hw
-        self.transport = transport
         self.tracks = []
         self.next_gate_off_us = None  # 下一次统一拉低门应发生的 tick（us）；None=无待办
 
     def add_track(self, track):
         self.tracks.append(track)
 
-    def tick(self):
-        """一个 ClockTick：推进全部通道并刷新门输出。"""
-        level = self.transport.level  # 全局输出电压
+    def tick(self, level):
+        """一个 ClockTick：推进全部通道并刷新门输出。level=全局输出电压。"""
         for t in self.tracks:
             on = t.output()
             if on:
@@ -531,10 +620,10 @@ class Sequencer:
 class Transport:
     """Transport：拥有全局时间（tempo / 时钟源 / 运行状态）。
     INT 模式由主循环以 microsecond tick 轮询驱动 ClockTick（见 update()）；
-    EXT 模式由 din 上升沿驱动。不直接接触 OLED/按钮/旋钮；仅通过回调通知节拍。"""
+    EXT 模式由 din 上升沿驱动。不直接接触任何 EuroPi API（Hardware 是唯一入口）；
+    仅通过回调通知节拍。"""
 
-    def __init__(self, hw, on_tick):
-        self.hw = hw
+    def __init__(self, on_tick):
         self._on_tick = on_tick
         self.bpm = 120
         self.mul = 4  # 时钟倍率：实际时钟 = BPM x mul
@@ -604,6 +693,21 @@ class Transport:
 
     def set_level(self, level):
         self.level = min(max(level, 0), 10)
+
+    # —— 序列化（模型自管，Controller 只做编排）——
+    def to_dict(self):
+        return {"source": self.source, "bpm": self.bpm,
+                "mul": self.mul, "level": self.level}
+
+    def from_dict(self, d):
+        if not d:
+            return
+        # 直接赋值（与原始 set_state 行为一致，不在此 restart/start）；
+        # 启动/停止由 Controller 在加载后依据 source 显式决定（见 __init__）。
+        self.source = d.get("source", self.source)
+        self.bpm = d.get("bpm", self.bpm)
+        self.mul = d.get("mul", self.mul)
+        self.level = d.get("level", self.level)
 
 
 # ---------------------------------------------------------------------------
@@ -722,8 +826,8 @@ class Euclidean2(EuroPiScript):
 
         self.hw = Hardware()
         self.app = AppState()
-        self.transport = Transport(self.hw, self._on_beat)
-        self.seq = Sequencer(self.hw, self.transport)
+        self.transport = Transport(self._on_beat)
+        self.seq = Sequencer(self.hw)
 
         # 6 通道默认节奏（差异化）
         for i in range(6):
@@ -746,7 +850,7 @@ class Euclidean2(EuroPiScript):
 
     # —— 节拍（ClockTick 事件）——
     def _on_beat(self):
-        self.seq.tick()
+        self.seq.tick(self.transport.level)
         self.app.dirty = True
 
     # —— 事件分发（Controller 的职责之一）——
@@ -797,53 +901,57 @@ class Euclidean2(EuroPiScript):
                 return
             if val == cur:
                 return
-            self.transport.set_source("EXT" if val == 1 else "INT")
-            self.on_changed()
+            src = "EXT" if val == 1 else "INT"
+            self._exec(SetTransportSource(self.transport, src))
         elif self.app.sel == 1:  # BPM
             self._apply_pickup(
-                self.transport.bpm, MIN_BPM, MAX_BPM, self.transport.set_bpm, p
+                self.transport.bpm, MIN_BPM, MAX_BPM,
+                lambda v: SetBpm(self.transport, v), p
             )
         elif self.app.sel == 2:  # mul（时钟倍率：实际时钟 = BPM x mul）
             self._apply_pickup(
-                self.transport.mul, MIN_MUL, MAX_MUL, self.transport.set_mul, p
+                self.transport.mul, MIN_MUL, MAX_MUL,
+                lambda v: SetMul(self.transport, v), p
             )
         else:  # 输出电压（全局，0~10V）
             self._apply_pickup(
-                self.transport.level, 0, 10, self.transport.set_level, p
+                self.transport.level, 0, 10,
+                lambda v: SetLevel(self.transport, v), p
             )
 
     def _edit_channel(self, track, p):
         kind = CH_PARAMS[self.app.sel][1]
         if kind == "rot1":
             self._apply_pickup(track.g1.rot, 0, track.g1.steps,
-                               lambda v: track.set_gen(1, "rot", v), p)
+                               lambda v: SetTrackParam(track, 1, "rot", v), p)
         elif kind == "rot2":
             self._apply_pickup(track.g2.rot, 0, track.g2.steps,
-                               lambda v: track.set_gen(2, "rot", v), p)
+                               lambda v: SetTrackParam(track, 2, "rot", v), p)
         elif kind == "steps1":
             self._apply_pickup(track.g1.steps, MIN_STEPS, MAX_STEPS,
-                               lambda v: track.set_gen(1, "steps", v), p)
+                               lambda v: SetTrackParam(track, 1, "steps", v), p)
         elif kind == "steps2":
             self._apply_pickup(track.g2.steps, MIN_STEPS, MAX_STEPS,
-                               lambda v: track.set_gen(2, "steps", v), p)
+                               lambda v: SetTrackParam(track, 2, "steps", v), p)
         elif kind == "pulses1":
             self._apply_pickup(track.g1.pulses, 0, track.g1.steps,
-                               lambda v: track.set_gen(1, "pulses", v), p)
+                               lambda v: SetTrackParam(track, 1, "pulses", v), p)
         elif kind == "pulses2":
             self._apply_pickup(track.g2.pulses, 0, track.g2.steps,
-                               lambda v: track.set_gen(2, "pulses", v), p)
+                               lambda v: SetTrackParam(track, 2, "pulses", v), p)
         elif kind == "prob1":
             self._apply_pickup(track.g1.prob, 0, 100,
-                               lambda v: track.set_gen(1, "prob", v), p)
+                               lambda v: SetTrackParam(track, 1, "prob", v), p)
         elif kind == "prob2":
             self._apply_pickup(track.g2.prob, 0, 100,
-                               lambda v: track.set_gen(2, "prob", v), p)
+                               lambda v: SetTrackParam(track, 2, "prob", v), p)
         elif kind == "merge":
-            self._apply_pickup(track.merge, 0, 4, track.set_merge, p, discrete=True)
+            self._apply_pickup(track.merge, 0, 4,
+                               lambda v: SetMerge(track, v), p, discrete=True)
 
-    def _apply_pickup(self, current, pmin, pmax, setter, p, discrete=False):
+    def _apply_pickup(self, current, pmin, pmax, make_cmd, p, discrete=False):
         """K2 拾取策略：旋钮位置匹配当前值（tol 容差）后才生效；生效后值变化即提交。
-        去除时间消抖：仅保留 tol 拾取匹配。"""
+        提交经 _exec(command) 统一执行（改模型 + 置 dirty）。"""
         val = round(p * (pmax - pmin)) + pmin
         val = min(max(val, pmin), pmax)
         tol = 0 if discrete else max(1, (pmax - pmin) // 32)
@@ -853,7 +961,13 @@ class Euclidean2(EuroPiScript):
             return
         if val == current:
             return
-        setter(val)
+        self._exec(make_cmd(val))
+
+    # —— 命令执行（Controller → Model 统一出口，与输入侧事件对称）——
+    def _exec(self, cmd):
+        """执行一个命令：改模型 + 置 dirty。所有模型变更都经此单一出口，
+        便于后续录制/回放/单测（交互层只产出命令，不直接改模型）。"""
+        cmd.execute()
         self.on_changed()
 
     # —— 状态持久化（受 SAVE_STATES 开关控制）——
@@ -862,56 +976,15 @@ class Euclidean2(EuroPiScript):
 
     def get_state(self):
         return {
-            "clock": {
-                "source": self.transport.source,
-                "bpm": self.transport.bpm,
-                "mul": self.transport.mul,
-                "level": self.transport.level,
-            },
-            "channels": [
-                {
-                    "g1": {
-                        "steps": c.g1.steps,
-                        "pulses": c.g1.pulses,
-                        "rot": c.g1.rot,
-                        "prob": c.g1.prob,
-                    },
-                    "g2": {
-                        "steps": c.g2.steps,
-                        "pulses": c.g2.pulses,
-                        "rot": c.g2.rot,
-                        "prob": c.g2.prob,
-                    },
-                    "merge": c.merge,
-                }
-                for c in self.seq.tracks
-            ],
+            "clock": self.transport.to_dict(),
+            "channels": [t.to_dict() for t in self.seq.tracks],
         }
 
     def set_state(self, state):
         try:
-            clk = state.get("clock", {})
-            self.transport.source = clk.get("source", "INT")
-            self.transport.bpm = clk.get("bpm", 120)
-            self.transport.mul = clk.get("mul", 4)
-            self.transport.level = clk.get("level", 5)
-            for i, c in enumerate(self.seq.tracks):
-                d = (state.get("channels") or [])[i]
-                if d is None:
-                    break
-                g1 = d["g1"]
-                g2 = d["g2"]
-                c.g1.steps = g1["steps"]
-                c.g1.pulses = g1["pulses"]
-                c.g1.rot = g1["rot"]
-                c.g1.prob = g1["prob"]
-                c.g1.regenerate()
-                c.g2.steps = g2["steps"]
-                c.g2.pulses = g2["pulses"]
-                c.g2.rot = g2["rot"]
-                c.g2.prob = g2["prob"]
-                c.g2.regenerate()
-                c.merge = d["merge"]
+            self.transport.from_dict(state.get("clock", {}))
+            for track, d in zip(self.seq.tracks, state.get("channels") or []):
+                track.from_dict(d)
         except Exception as e:
             print("Euclidean2: failed to load state:", e)
 
