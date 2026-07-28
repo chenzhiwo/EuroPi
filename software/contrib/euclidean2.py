@@ -363,14 +363,22 @@ class Hardware:
         return q
 
     def on_clock_rise(self, cb):
-        # 注册 DIN 上升沿回调：中断上下文只做轻量调度，把真正的回调推到主循环执行，
-        # 消除与主循环的共享状态竞争（见 _push_clock）。
-        def _isr(_):
+        # 直接注册到 DIN 原始引脚，绕开 europi 的 _bounce_wrapper：
+        #   · 设备上 _bounce_wrapper 对 handler 的调用签名与本项目不符，会直接抛
+        #     TypeError（见运行期崩溃），导致外部时钟根本无法生效；
+        #   · 同时避开 europi 自带的 debounce（din 默认 0，但固件版本差异可能吞掉
+        #     高速时钟脉冲）。
+        # 触发边沿用 IRQ_FALLING：europi 的 value() 已反相，物理下降沿对应“逻辑高”
+        # 的起始，与原 din.handler(上升沿回调) 的相位一致。
+        pin = self.din.pin
+
+        def _isr(*_):
             try:
                 micropython.schedule(cb, None)
             except (ValueError, RuntimeError):
                 pass  # 调度队列满（正常时钟速率下不会发生），丢弃本次 tick
-        self.din.handler(_isr)
+
+        pin.irq(trigger=pin.IRQ_FALLING, handler=_isr)
 
     # --- CV / Gate 输出（输出事件的落点）---
     def set_cv(self, idx, voltage):
