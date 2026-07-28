@@ -149,10 +149,10 @@ def combine_outputs(on1, on2, mode):
 # 通道参数顺序（K1 遍历），(缩写, 内部kind)，缩写统一 4 字符便于顶栏阅读
 CH_PARAMS = [
     ("ROT1", "rot1"),
-    ("PLS1", "pulses1"),
-    ("STP1", "steps1"),
     ("ROT2", "rot2"),
+    ("PLS1", "pulses1"),
     ("PLS2", "pulses2"),
+    ("STP1", "steps1"),
     ("STP2", "steps2"),
     ("PRB1", "prob1"),
     ("PRB2", "prob2"),
