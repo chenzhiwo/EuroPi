@@ -42,7 +42,6 @@ UI（128x32）：
   行0 状态栏  P{page} {缩写}:{值}（全局页 P0 仅显示此行）
   行1 Gen1 序列（实心=触发，点=空步），当前步固定在最左(col0)
   行2 Gen2 序列，同左锚定前瞻滚动窗（最多 16 步，超出按播放头左滚）
-  行3 合并结果序列（移位寄存器 out_reg，长度 = min(16, 最短序列)）
 
 --------------------------------------------------------------------------------
 单文件分层架构（参照 europi-ws/ARCHITECTURE.md 的亮点，受"保持单文件"约束）
@@ -118,10 +117,10 @@ import micropython
 from utime import ticks_diff, ticks_ms, ticks_us, ticks_add
 
 
-# 状态持久化总开关：False 时完全屏蔽 save states 功能——既不从 flash 加载
-# 历史状态（每次启动都用默认/初始状态），也不在运行中写盘（避免阻塞式写
-# flash 造成的 25~60ms 周期卡顿）。需要保留参数时改回 True。
-SAVE_STATES = False
+# 状态持久化总开关：True 时允许保存。保存仅在用户长按 K1 时显式触发
+# （见 dispatch 的 B1 long 分支），不在主循环里自动写盘，避免阻塞式写
+# flash 的 25~60ms 卡顿拖慢节拍。
+SAVE_STATES = True
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +165,7 @@ MAX_BPM = 240
 MIN_MUL = 1
 MAX_MUL = 8  # 时钟倍率（实际时钟 = BPM x mul）；上限 8 以保证每拍间隔 (>31ms) 留出刷新窗口
 MAX_STEPS = 64  # 单发生器序列最大步数
+MIN_STEPS = 1   # 单发生器序列最小步数
 GATE_MS = 5  # 时钟事件后统一拉低输出的延迟（ms）
 T_SHOW_US = 20_000  # 屏幕刷新预留窗口（微秒）；距离下次时钟事件不足该值时跳过刷新
 
@@ -350,8 +350,8 @@ class EuclidPattern:
         self.pattern = generate_euclidean_pattern(self.steps, self.pulses, self.rot)
 
     def set_steps(self, steps):
-        self.steps = steps
-        if self.pulses > steps:
+        self.steps = min(max(steps, MIN_STEPS), MAX_STEPS)
+        if self.pulses > self.steps:
             self.pulses = steps
         if self.rot > steps:
             self.rot = steps
@@ -374,7 +374,7 @@ class Track:
     """Track = Pattern × 2 + TrackSettings + TrackPlayer（一个通道）。
     - Pattern:    g1 / g2 的欧几里得序列（steps/pulses/rot/prob + pattern[]）
     - TrackSettings: merge（输出电压为全局项，见 Transport.level）
-    - TrackPlayer:  g1_pos / g2_pos 播放头 + out_reg 移位寄存器输出序列
+    - TrackPlayer:  g1_pos / g2_pos 播放头（输出由 g1/g2 合并直接计算，无移位寄存器）
     """
 
     def __init__(self, cv_index, g1, g2, merge):
@@ -384,8 +384,7 @@ class Track:
         self.merge = merge
         self.g1_pos = g1.steps - 1  # 首次 advance 后落于 0
         self.g2_pos = g2.steps - 1
-        self.out_reg = []
-        self.rebuild_reg()
+        self.last_out = False  # 当前步（最近一次时钟事件）的触发状态
 
     # —— TrackSettings 命令（由 UI 页译为命令后调用）——
     def set_gen(self, which, attr, val):
@@ -398,27 +397,11 @@ class Track:
             g.set_rot(val)
         elif attr == "prob":
             g.set_prob(val)
-        self.rebuild_reg()
 
     def set_merge(self, val):
         self.merge = val
-        self.rebuild_reg()
 
     # —— TrackPlayer 运行时 ——
-    def reg_len(self):
-        return min(16, min(self.g1.steps, self.g2.steps))
-
-    def rebuild_reg(self):
-        """依当前双序列重建移位寄存器（输出序列），长度 = min(16, 最短序列)。"""
-        n = self.reg_len()
-        m = min(self.g1.steps, self.g2.steps)
-        self.out_reg = []
-        for i in range(n):
-            idx = (self.g1_pos + i) % m
-            self.out_reg.append(
-                combine_outputs(self.g1.pattern[idx], self.g2.pattern[idx], self.merge)
-            )
-
     def _active(self, gen, pos):
         """该播放头步是否应触发（pattern 且通过概率保留判定）。"""
         if not gen.pattern[pos]:
@@ -430,23 +413,14 @@ class Track:
         return random.random() < gen.prob / 100.0
 
     def output(self):
-        """推进一拍：两路播放头前进，按合并+概率计算 ON/OFF，并滚动输出序列。
+        """推进一拍：两路播放头前进，按合并+概率计算 ON/OFF。
         返回该通道本拍是否触发（True/False）；由调用方翻译为 CV/Gate 输出事件。"""
         self.g1_pos = (self.g1_pos + 1) % self.g1.steps
         self.g2_pos = (self.g2_pos + 1) % self.g2.steps
         on1 = self._active(self.g1, self.g1_pos)
         on2 = self._active(self.g2, self.g2_pos)
         out = combine_outputs(on1, on2, self.merge)
-        # 移位寄存器一步操作：左端取出（已播放），右侧按输入序列压入新值
-        if self.out_reg:
-            n = len(self.out_reg)
-            m = min(self.g1.steps, self.g2.steps)
-            idx = (self.g1_pos + (n - 1)) % m
-            new_val = combine_outputs(
-                self.g1.pattern[idx], self.g2.pattern[idx], self.merge
-            )
-            self.out_reg.pop(0)
-            self.out_reg.append(new_val)
+        self.last_out = out  # 记录当前步触发状态，供屏幕左下角指示
         return out
 
 
@@ -611,12 +585,12 @@ class Renderer:
     def render(self, app, seq, transport, hw):
         hw.display_clear()
         if app.page == 0:
-            self._draw_global(app, transport, hw)
+            self._draw_global(app, transport, seq, hw)
         else:
             self._draw_channel(app, seq.tracks[app.page - 1], hw)
         hw.display_show()
 
-    def _draw_global(self, app, transport, hw):
+    def _draw_global(self, app, transport, seq, hw):
         # 全局时钟页只显示顶栏（P0 CLK:.. / P0 BPM:.. / P0 MUL:.. / P0 LVL:..），其余行留空
         if app.sel == 0:
             hw.display_text(f"P0 CLK:{transport.source}", 0, 0)
@@ -626,6 +600,8 @@ class Renderer:
             hw.display_text(f"P0 MUL:{transport.mul}", 0, 0)
         else:
             hw.display_text(f"P0 LVL:{transport.level}V", 0, 0)
+        # 左下角指示：本拍是否有任意通道触发
+        self._draw_step_indicator(any(t.last_out for t in seq.tracks), hw)
 
     def _draw_channel(self, app, track, hw):
         abbr, kind = CH_PARAMS[app.sel]
@@ -636,7 +612,8 @@ class Renderer:
         hw.display_text(f"P{app.page} {abbr}:{val}", 0, 0)
         self._draw_seq_row(track.g1, track.g1_pos, 8, hw)
         self._draw_seq_row(track.g2, track.g2_pos, 16, hw)
-        self._draw_result_row(track, 24, hw)
+        # 左下角指示：当前步（本通道）的触发状态
+        self._draw_step_indicator(track.last_out, hw)
 
     def _param_value(self, track, kind):
         mapping = {
@@ -661,15 +638,12 @@ class Renderer:
             else:
                 hw.display_fill_rect(x + 2, y + 2, 2, 2, 1)
 
-    def _draw_result_row(self, track, y, hw):
-        # 底行 = 移位寄存器风格的输出序列（track.out_reg），长度 = min(16, 最短序列)
-        for i, on in enumerate(track.out_reg):
-            x = i * 8
-            if on:
-                hw.display_fill_rect(x, y, 6, 6, 1)
-            else:
-                hw.display_fill_rect(x + 2, y + 2, 2, 2, 1)
-
+    def _draw_step_indicator(self, on, hw):
+        # 屏幕最左下角：实心方块 = 当前步触发，点 = 未触发
+        if on:
+            hw.display_fill_rect(0, 26, 6, 6, 1)
+        else:
+            hw.display_fill_rect(2, 28, 2, 2, 1)
 
 # ---------------------------------------------------------------------------
 # Controller / Application —— 事件分发 + 命令派发 + 触发渲染（几乎无业务逻辑）
@@ -713,9 +687,6 @@ class Euclidean2(EuroPiScript):
         self.seq.tick()
         self.app.dirty = True
 
-    def manual_advance(self):
-        self._on_beat()
-
     # —— 事件分发（Controller 的职责之一）——
     def dispatch(self, ev):
         if isinstance(ev, KnobTurn):
@@ -726,7 +697,7 @@ class Euclidean2(EuroPiScript):
         elif isinstance(ev, ButtonEvent):
             if ev.button == "B1":
                 if ev.kind == "long":
-                    self.manual_advance()
+                    self.save_state(force=True)  # 长按 K1：显式保存（唯一触发 save 的途径）
                 else:
                     self.app.prev_page()
             else:  # B2
@@ -785,10 +756,10 @@ class Euclidean2(EuroPiScript):
             self._apply_pickup(track.g2.rot, 0, track.g2.steps,
                                lambda v: track.set_gen(2, "rot", v), p)
         elif kind == "steps1":
-            self._apply_pickup(track.g1.steps, 4, MAX_STEPS,
+            self._apply_pickup(track.g1.steps, MIN_STEPS, MAX_STEPS,
                                lambda v: track.set_gen(1, "steps", v), p)
         elif kind == "steps2":
-            self._apply_pickup(track.g2.steps, 4, MAX_STEPS,
+            self._apply_pickup(track.g2.steps, MIN_STEPS, MAX_STEPS,
                                lambda v: track.set_gen(2, "steps", v), p)
         elif kind == "pulses1":
             self._apply_pickup(track.g1.pulses, 0, track.g1.steps,
@@ -878,7 +849,6 @@ class Euclidean2(EuroPiScript):
                 c.g2.prob = g2["prob"]
                 c.g2.regenerate()
                 c.merge = d["merge"]
-                c.rebuild_reg()
         except Exception as e:
             print("Euclidean2: failed to load state:", e)
 
@@ -887,12 +857,12 @@ class Euclidean2(EuroPiScript):
         if state:
             self.set_state(state)
 
-    def save_state(self):
+    def save_state(self, force=False):
         if not SAVE_STATES:
             return
-        if not self._dirty_save:
+        if not force and not self._dirty_save:
             return
-        if self.last_saved() < 1000:
+        if not force and self.last_saved() < 1000:
             return
         self.save_state_json(self.get_state())
         self._dirty_save = False
@@ -912,7 +882,6 @@ class Euclidean2(EuroPiScript):
                 if gap is None or gap >= T_SHOW_US:
                     self.renderer.render(self.app, self.seq, self.transport, self.hw)
                     self.app.dirty = False
-            self.save_state()
             time.sleep_ms(0)
 
 
