@@ -151,6 +151,15 @@ def combine_outputs(on1, on2, mode):
 
 
 # 通道参数顺序（K1 遍历），(缩写, 内部kind)，缩写统一 4 字符便于顶栏阅读
+# —— 全局常量（取值范围，供 CH_PARAMS / GLOBAL_PARAMS 等表驱动引用）——
+MIN_BPM = 20
+MAX_BPM = 240
+MIN_MUL = 1
+MAX_MUL = 8  # 时钟倍率（实际时钟 = BPM x mul）；上限 8 以保证每拍间隔 (>31ms) 留出刷新窗口
+MAX_STEPS = 64  # 单发生器序列最大步数
+MIN_STEPS = 1   # 单发生器序列最小步数
+GATE_MS = 5  # 时钟事件后统一拉低输出的延迟（ms）
+
 CH_PARAMS = [
     ("ROT1", "rot1"),
     ("ROT2", "rot2"),
@@ -163,15 +172,31 @@ CH_PARAMS = [
     ("MERG", "merge"),
 ]
 
+# 全局页参数表（与 CH_PARAMS 对称驱动）：
+#   (缩写, pmin, pmax, discrete?, get_cur(transport)->当前值,
+#    make_cmd(transport, v)->Command, fmt(transport)->顶栏显示值)
+# 时钟源作为离散 0/1 参数纳入同一拾取/编辑流程，不特判；所有参数任何时候都可编辑。
+GLOBAL_PARAMS = [
+    ("CLK", 0, 1, True,
+     lambda t: 0 if t.source == "INT" else 1,
+     lambda t, v: SetTransportSource(t, "EXT" if v else "INT"),
+     lambda t: t.source),
+    ("BPM", MIN_BPM, MAX_BPM, False,
+     lambda t: t.bpm,
+     lambda t, v: SetBpm(t, v),
+     lambda t: t.bpm),
+    ("MUL", MIN_MUL, MAX_MUL, False,
+     lambda t: t.mul,
+     lambda t, v: SetMul(t, v),
+     lambda t: t.mul),
+    ("LVL", 0, 10, False,
+     lambda t: t.level,
+     lambda t, v: SetLevel(t, v),
+     lambda t: f"{t.level}V"),
+]
+
 NUM_PAGES = 7  # 0 全局 + 1..6 通道
 
-MIN_BPM = 20
-MAX_BPM = 240
-MIN_MUL = 1
-MAX_MUL = 8  # 时钟倍率（实际时钟 = BPM x mul）；上限 8 以保证每拍间隔 (>31ms) 留出刷新窗口
-MAX_STEPS = 64  # 单发生器序列最大步数
-MIN_STEPS = 1   # 单发生器序列最小步数
-GATE_MS = 5  # 时钟事件后统一拉低输出的延迟（ms）
 T_SHOW_US = 20_000  # 屏幕刷新预留窗口（微秒）；距离下次时钟事件不足该值时跳过刷新
 DEBOUNCE_MS = 30       # 按键去抖窗口（ms）：raw 变化后须连续稳定达此宽才认定状态变更
 KNOB_DEADBAND = 0.01  # 旋钮采样死区（1%）：低于此变化视为 ADC 抖动，保持上次稳定值
@@ -726,7 +751,7 @@ class AppState:
 
     def _set_page(self, p):
         self.page = p
-        n = 4 if p == 0 else len(CH_PARAMS)  # P0：时钟源 / BPM / MUL / 输出电压
+        n = len(GLOBAL_PARAMS) if p == 0 else len(CH_PARAMS)
         if self.sel >= n:
             self.sel = n - 1
         self.k2_picked = False
@@ -760,15 +785,9 @@ class Renderer:
 
     def _draw_global(self, app, transport, hw):
         # 全局时钟页只显示顶栏（P0 CLK:.. / P0 BPM:.. / P0 MUL:.. / P0 LVL:..），其余行留空；
-        # P0 无对应 track，左下角不绘制触发指示
-        if app.sel == 0:
-            hw.display_text(f"P0 CLK:{transport.source}", 0, 0)
-        elif app.sel == 1:
-            hw.display_text(f"P0 BPM:{transport.bpm}", 0, 0)
-        elif app.sel == 2:
-            hw.display_text(f"P0 MUL:{transport.mul}", 0, 0)
-        else:
-            hw.display_text(f"P0 LVL:{transport.level}V", 0, 0)
+        # P0 无对应 track，左下角不绘制触发指示。显示完全由 GLOBAL_PARAMS 表驱动。
+        abbr, _, _, _, _, _, fmt = GLOBAL_PARAMS[app.sel]
+        hw.display_text(f"P0 {abbr}:{fmt(transport)}", 0, 0)
 
     def _draw_channel(self, app, track, hw):
         abbr, kind = CH_PARAMS[app.sel]
@@ -877,13 +896,14 @@ class Euclidean2(EuroPiScript):
 
     # —— UI Pages：把交互译为命令（只调用 Transport / Track 的设置器）——
     def _on_knob1(self, p):
-        n = 4 if self.app.page == 0 else len(CH_PARAMS)
+        n = len(GLOBAL_PARAMS) if self.app.page == 0 else len(CH_PARAMS)
         idx = int(p * n)  # 截断实现 ±0.5 档迟滞，防边界抖动
         if idx >= n:
             idx = n - 1
         if idx != self.app.sel:
             self.app.sel = idx
             self.app.k2_picked = False
+            self.on_changed()  # 选中项变了，立即请求重绘（修复停钟时不刷新的问题）
 
     def _on_knob2(self, p):
         if self.app.page == 0:
@@ -892,32 +912,14 @@ class Euclidean2(EuroPiScript):
             self._edit_channel(self.seq.tracks[self.app.page - 1], p)
 
     def _edit_global(self, p):
-        if self.app.sel == 0:  # 时钟源（离散）
-            val = 1 if p > 0.5 else 0
-            cur = 0 if self.transport.source == "INT" else 1
-            if not self.app.k2_picked:
-                if val == cur:
-                    self.app.k2_picked = True
-                return
-            if val == cur:
-                return
-            src = "EXT" if val == 1 else "INT"
-            self._exec(SetTransportSource(self.transport, src))
-        elif self.app.sel == 1:  # BPM
-            self._apply_pickup(
-                self.transport.bpm, MIN_BPM, MAX_BPM,
-                lambda v: SetBpm(self.transport, v), p
-            )
-        elif self.app.sel == 2:  # mul（时钟倍率：实际时钟 = BPM x mul）
-            self._apply_pickup(
-                self.transport.mul, MIN_MUL, MAX_MUL,
-                lambda v: SetMul(self.transport, v), p
-            )
-        else:  # 输出电压（全局，0~10V）
-            self._apply_pickup(
-                self.transport.level, 0, 10,
-                lambda v: SetLevel(self.transport, v), p
-            )
+        # 全部全局参数走同一套拾取/编辑流程（GLOBAL_PARAMS 表驱动）；
+        # 时钟源作为 discrete 离散参数（0=INT/1=EXT），与 BPM 等对称，无特判。
+        _, pmin, pmax, discrete, get_cur, make_cmd, _ = GLOBAL_PARAMS[self.app.sel]
+        cur = get_cur(self.transport)
+        self._apply_pickup(
+            cur, pmin, pmax,
+            lambda v: make_cmd(self.transport, v), p, discrete=discrete
+        )
 
     def _edit_channel(self, track, p):
         kind = CH_PARAMS[self.app.sel][1]
