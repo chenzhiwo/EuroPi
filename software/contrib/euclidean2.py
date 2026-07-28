@@ -114,6 +114,7 @@ except ImportError:
 
 import random
 import time
+import micropython
 from utime import ticks_diff, ticks_ms, ticks_us, ticks_add
 
 
@@ -163,7 +164,7 @@ NUM_PAGES = 7  # 0 全局 + 1..6 通道
 MIN_BPM = 20
 MAX_BPM = 240
 MIN_MUL = 1
-MAX_MUL = 16  # 时钟倍率（实际时钟 = BPM x mul）
+MAX_MUL = 8  # 时钟倍率（实际时钟 = BPM x mul）；上限 8 以保证每拍间隔 (>31ms) 留出刷新窗口
 MAX_STEPS = 64  # 单发生器序列最大步数
 GATE_MS = 5  # 时钟事件后统一拉低输出的延迟（ms）
 K2_DEBOUNCE_MS = 40  # K2 数值提交消抖窗口（ms）
@@ -223,8 +224,15 @@ class Hardware:
         return self.b2.value() == HIGH
 
     def on_clock_rise(self, cb):
-        # 注册 DIN 上升沿回调（外部时钟源时由 Transport 驱动）
-        self.din.handler(cb)
+        # 注册 DIN 上升沿回调（外部时钟源时由 Transport 驱动）。
+        # 中断上下文里只做轻量调度：用 micropython.schedule 把真正的回调推到
+        # 主循环执行，避免在 ISR 中做 CV 输出等重活、并消除与主循环的共享状态竞争。
+        def _isr(_):
+            try:
+                micropython.schedule(cb, None)
+            except (ValueError, RuntimeError):
+                pass  # 调度队列满（正常时钟速率下不会发生），丢弃本次 tick
+        self.din.handler(_isr)
 
     # --- CV / Gate 输出（输出事件的落点）---
     def set_cv(self, idx, voltage):
@@ -503,13 +511,14 @@ class Transport:
         self.running = False
 
     def update(self, now_us):
-        """主循环每轮调用：若已达/超过下一次时钟事件，则触发节拍并推进调度。
-        使用 ticks_diff 判断应触发，自动追平错过的事件（catch-up）。"""
+        """主循环每轮调用：若已达/超过下一次时钟事件，则触发一次节拍并重新锚定调度。
+        无论错过多少 tick 都只补一次（重新锚定到 now_us 之后），避免阻塞后爆发式追拍。"""
         if self.source != "INT" or not self.running:
             return
-        while ticks_diff(now_us, self.next_clock_us) >= 0:
+        if ticks_diff(now_us, self.next_clock_us) >= 0:
             self._on_tick()
-            self.next_clock_us = ticks_add(self.next_clock_us, self.beat_us())
+            # 重新锚定到当前时刻之后一个 beat，丢弃所有错过的 tick
+            self.next_clock_us = ticks_add(now_us, self.beat_us())
 
     def time_to_next_clock_us(self, now_us):
         """距离下一次内部时钟事件的微秒数；非 INT 运行态返回 None。"""
@@ -912,7 +921,7 @@ class Euclidean2(EuroPiScript):
                     self.renderer.render(self.app, self.seq, self.transport, self.hw)
                     self.app.dirty = False
             self.save_state()
-            time.sleep_ms(1)
+            time.sleep_ms(0)
 
 
 if __name__ == "__main__":
