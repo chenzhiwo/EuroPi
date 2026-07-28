@@ -112,10 +112,9 @@ try:
 except ImportError:
     from firmware.experimental.euclid import generate_euclidean_pattern
 
-import machine
 import random
 import time
-from utime import ticks_diff, ticks_ms
+from utime import ticks_diff, ticks_ms, ticks_us, ticks_add
 
 
 # 状态持久化总开关：False 时完全屏蔽 save states 功能——既不从 flash 加载
@@ -168,6 +167,7 @@ MAX_MUL = 16  # 时钟倍率（实际时钟 = BPM x mul）
 MAX_STEPS = 64  # 单发生器序列最大步数
 GATE_MS = 5  # 时钟事件后统一拉低输出的延迟（ms）
 K2_DEBOUNCE_MS = 40  # K2 数值提交消抖窗口（ms）
+T_SHOW_US = 20_000  # 屏幕刷新预留窗口（微秒）；距离下次时钟事件不足该值时跳过刷新
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +443,7 @@ class Sequencer:
         self.hw = hw
         self.transport = transport
         self.tracks = []
-        self._gate_timer = machine.Timer()
+        self.next_gate_off_us = None  # 下一次统一拉低门应发生的 tick（us）；None=无待办
 
     def add_track(self, track):
         self.tracks.append(track)
@@ -457,12 +457,14 @@ class Sequencer:
                 self.hw.set_cv(t.cv_index, level)
             else:
                 self.hw.off_cv(t.cv_index)
-        # 统一在 GATE_MS 后拉低所有门（输出事件 → Hardware Adapter）
-        self._gate_timer.init(
-            period=GATE_MS,
-            mode=machine.Timer.ONE_SHOT,
-            callback=self._gate_off,
-        )
+        # 统一在 GATE_MS 后拉低所有门（由主循环 update() 触发）
+        self.next_gate_off_us = ticks_add(ticks_us(), GATE_MS * 1000)
+
+    def update(self, now_us):
+        """主循环每轮调用：若已达/超过门控关闭时刻，则统一拉低所有门。"""
+        if self.next_gate_off_us is not None and ticks_diff(now_us, self.next_gate_off_us) >= 0:
+            self._gate_off()
+            self.next_gate_off_us = None
 
     def _gate_off(self, _=None):
         self.hw.off_all_cvs()
@@ -474,8 +476,8 @@ class Sequencer:
 
 class Transport:
     """Transport：拥有全局时间（tempo / 时钟源 / 运行状态）。
-    INT 模式用内部 Timer 周期驱动 ClockTick；EXT 模式由 din 上升沿驱动。
-    不直接接触 OLED/按钮/旋钮；仅通过回调通知节拍。"""
+    INT 模式由主循环以 microsecond tick 轮询驱动 ClockTick（见 update()）；
+    EXT 模式由 din 上升沿驱动。不直接接触 OLED/按钮/旋钮；仅通过回调通知节拍。"""
 
     def __init__(self, hw, on_tick):
         self.hw = hw
@@ -485,30 +487,35 @@ class Transport:
         self.level = 5  # 全局输出 CV 电平（0~10V）
         self.source = "INT"
         self.running = False
-        self._clock_timer = machine.Timer()
+        self.next_clock_us = 0  # 下一次内部时钟事件应发生的 tick（us）
 
-    def beat_ms(self):
+    def beat_us(self):
         # 实际每拍间隔 = 60s / (BPM x mul)
         eff = self.bpm * self.mul
-        return max(1, 60000 // eff)
+        return max(1, 60_000_000 // eff)
 
     def start(self):
-        if self.running:
-            self._clock_timer.deinit()
-        self._clock_timer.init(
-            period=self.beat_ms(),
-            mode=machine.Timer.PERIODIC,
-            callback=self._fire_tick,
-        )
+        # 重置相位：下一次时钟事件安排在 beat_us 之后
+        self.next_clock_us = ticks_add(ticks_us(), self.beat_us())
         self.running = True
 
     def stop(self):
-        if self.running:
-            self._clock_timer.deinit()
-            self.running = False
+        self.running = False
 
-    def _fire_tick(self, _=None):
-        self._on_tick()
+    def update(self, now_us):
+        """主循环每轮调用：若已达/超过下一次时钟事件，则触发节拍并推进调度。
+        使用 ticks_diff 判断应触发，自动追平错过的事件（catch-up）。"""
+        if self.source != "INT" or not self.running:
+            return
+        while ticks_diff(now_us, self.next_clock_us) >= 0:
+            self._on_tick()
+            self.next_clock_us = ticks_add(self.next_clock_us, self.beat_us())
+
+    def time_to_next_clock_us(self, now_us):
+        """距离下一次内部时钟事件的微秒数；非 INT 运行态返回 None。"""
+        if self.source != "INT" or not self.running:
+            return None
+        return ticks_diff(self.next_clock_us, now_us)
 
     def ext_tick(self, t=None):
         # 仅在外部时钟源时由 din 上升沿驱动（INT 时忽略）
@@ -889,16 +896,23 @@ class Euclidean2(EuroPiScript):
         self.save_state_json(self.get_state())
         self._dirty_save = False
 
-    # —— 主循环 ——
+    # —— 主循环（microsecond tick 驱动）——
     def main(self):
         while True:
+            now_us = ticks_us()
+            # 内部时钟 / 门控关闭：到达应发生的 tick 时由主循环触发
+            self.transport.update(now_us)
+            self.seq.update(now_us)
             for ev in self.input.poll():
                 self.dispatch(ev)
+            # 屏幕刷新：预留 t_show，距离下次时钟事件 < t_show 时跳过，避免抢占时钟精度
             if self.app.dirty:
-                self.renderer.render(self.app, self.seq, self.transport, self.hw)
-                self.app.dirty = False
+                gap = self.transport.time_to_next_clock_us(now_us)
+                if gap is None or gap >= T_SHOW_US:
+                    self.renderer.render(self.app, self.seq, self.transport, self.hw)
+                    self.app.dirty = False
             self.save_state()
-            time.sleep_ms(5)
+            time.sleep_ms(1)
 
 
 if __name__ == "__main__":
