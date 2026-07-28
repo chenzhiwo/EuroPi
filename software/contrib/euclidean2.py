@@ -167,7 +167,6 @@ MIN_MUL = 1
 MAX_MUL = 8  # 时钟倍率（实际时钟 = BPM x mul）；上限 8 以保证每拍间隔 (>31ms) 留出刷新窗口
 MAX_STEPS = 64  # 单发生器序列最大步数
 GATE_MS = 5  # 时钟事件后统一拉低输出的延迟（ms）
-K2_DEBOUNCE_MS = 40  # K2 数值提交消抖窗口（ms）
 T_SHOW_US = 20_000  # 屏幕刷新预留窗口（微秒）；距离下次时钟事件不足该值时跳过刷新
 
 
@@ -277,6 +276,9 @@ class InputManager:
         # 复用单例事件对象，避免每轮分配
         self._knob1 = KnobTurn(1, 0.0)
         self._knob2 = KnobTurn(2, 0.0)
+        # 旋钮事件驱动：仅当相对上次发出值变化 >= 1% 时才产生事件
+        self._knob1_last = -1.0  # -1 强制首轮发出初始状态
+        self._knob2_last = -1.0
 
     def poll(self):
         events = []
@@ -314,11 +316,17 @@ class InputManager:
                 events.append(ButtonEvent("B2", "press"))
         self._b2_down = d2
 
-        # 旋钮：每轮上报当前位置（页面层据其解释）
-        self._knob1.value = self.hw.knob1()
-        self._knob2.value = self.hw.knob2()
-        events.append(self._knob1)
-        events.append(self._knob2)
+        # 旋钮：事件驱动，仅当位置变化超过 1% 才发出事件（携带当前值）
+        v1 = self.hw.knob1()
+        if abs(v1 - self._knob1_last) >= 0.01:
+            self._knob1_last = v1
+            self._knob1.value = v1
+            events.append(self._knob1)
+        v2 = self.hw.knob2()
+        if abs(v2 - self._knob2_last) >= 0.01:
+            self._knob2_last = v2
+            self._knob2.value = v2
+            events.append(self._knob2)
         return events
 
 
@@ -572,8 +580,6 @@ class AppState:
         self.page = 0
         self.sel = 0
         self.k2_picked = False
-        self.k2_pending = None
-        self.k2_pending_t = 0
         self.dirty = True  # 显示需要重绘
 
     def _set_page(self, p):
@@ -582,7 +588,6 @@ class AppState:
         if self.sel >= n:
             self.sel = n - 1
         self.k2_picked = False
-        self.k2_pending = None
         self.dirty = True
 
     def prev_page(self):
@@ -739,7 +744,6 @@ class Euclidean2(EuroPiScript):
         if idx != self.app.sel:
             self.app.sel = idx
             self.app.k2_picked = False
-            self.app.k2_pending = None
 
     def _on_knob2(self, p):
         if self.app.page == 0:
@@ -756,11 +760,9 @@ class Euclidean2(EuroPiScript):
                     self.app.k2_picked = True
                 return
             if val == cur:
-                self.app.k2_pending = None
                 return
             self.transport.set_source("EXT" if val == 1 else "INT")
             self.on_changed()
-            self.app.k2_pending = None
         elif self.app.sel == 1:  # BPM
             self._apply_pickup(
                 self.transport.bpm, MIN_BPM, MAX_BPM, self.transport.set_bpm, p
@@ -804,29 +806,19 @@ class Euclidean2(EuroPiScript):
             self._apply_pickup(track.merge, 0, 4, track.set_merge, p, discrete=True)
 
     def _apply_pickup(self, current, pmin, pmax, setter, p, discrete=False):
-        """K2 拾取策略：旋钮位置匹配当前值后才生效；提交前做 K2_DEBOUNCE_MS 消抖。"""
+        """K2 拾取策略：旋钮位置匹配当前值（tol 容差）后才生效；生效后值变化即提交。
+        去除时间消抖：仅保留 tol 拾取匹配。"""
         val = round(p * (pmax - pmin)) + pmin
         val = min(max(val, pmin), pmax)
         tol = 0 if discrete else max(1, (pmax - pmin) // 32)
         if not self.app.k2_picked:
             if abs(val - current) <= tol:
                 self.app.k2_picked = True
-                self.app.k2_pending = None
             return
         if val == current:
-            self.app.k2_pending = None
-            return
-        # 消抖：目标值需在 K2_DEBOUNCE_MS 窗口内保持稳定（无跳变）才提交
-        now = ticks_ms()
-        if val != self.app.k2_pending:
-            self.app.k2_pending = val
-            self.app.k2_pending_t = now
-            return
-        if ticks_diff(now, self.app.k2_pending_t) < K2_DEBOUNCE_MS:
             return
         setter(val)
         self.on_changed()
-        self.app.k2_pending = None
 
     # —— 状态持久化（受 SAVE_STATES 开关控制）——
     def on_changed(self):
