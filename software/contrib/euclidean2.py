@@ -585,13 +585,14 @@ class Renderer:
     def render(self, app, seq, transport, hw):
         hw.display_clear()
         if app.page == 0:
-            self._draw_global(app, transport, seq, hw)
+            self._draw_global(app, transport, hw)
         else:
             self._draw_channel(app, seq.tracks[app.page - 1], hw)
         hw.display_show()
 
-    def _draw_global(self, app, transport, seq, hw):
-        # 全局时钟页只显示顶栏（P0 CLK:.. / P0 BPM:.. / P0 MUL:.. / P0 LVL:..），其余行留空
+    def _draw_global(self, app, transport, hw):
+        # 全局时钟页只显示顶栏（P0 CLK:.. / P0 BPM:.. / P0 MUL:.. / P0 LVL:..），其余行留空；
+        # P0 无对应 track，左下角不绘制触发指示
         if app.sel == 0:
             hw.display_text(f"P0 CLK:{transport.source}", 0, 0)
         elif app.sel == 1:
@@ -600,8 +601,6 @@ class Renderer:
             hw.display_text(f"P0 MUL:{transport.mul}", 0, 0)
         else:
             hw.display_text(f"P0 LVL:{transport.level}V", 0, 0)
-        # 左下角指示：本拍是否有任意通道触发
-        self._draw_step_indicator(any(t.last_out for t in seq.tracks), hw)
 
     def _draw_channel(self, app, track, hw):
         abbr, kind = CH_PARAMS[app.sel]
@@ -670,7 +669,6 @@ class Euclidean2(EuroPiScript):
 
         self.input = InputManager(self.hw)
         self.renderer = Renderer()
-        self._dirty_save = False
 
         # 时钟输入：注册 din 回调；仅在 EXT 时由 Transport.ext_tick 驱动
         self.hw.on_clock_rise(self.transport.ext_tick)
@@ -697,7 +695,7 @@ class Euclidean2(EuroPiScript):
         elif isinstance(ev, ButtonEvent):
             if ev.button == "B1":
                 if ev.kind == "long":
-                    self.save_state(force=True)  # 长按 K1：显式保存（唯一触发 save 的途径）
+                    self.save_state()  # 长按 K1：显式保存（唯一触发 save 的途径）
                 else:
                     self.app.prev_page()
             else:  # B2
@@ -794,8 +792,6 @@ class Euclidean2(EuroPiScript):
     # —— 状态持久化（受 SAVE_STATES 开关控制）——
     def on_changed(self):
         self.app.dirty = True
-        if SAVE_STATES:
-            self._dirty_save = True
 
     def get_state(self):
         return {
@@ -857,15 +853,10 @@ class Euclidean2(EuroPiScript):
         if state:
             self.set_state(state)
 
-    def save_state(self, force=False):
+    def save_state(self):
         if not SAVE_STATES:
             return
-        if not force and not self._dirty_save:
-            return
-        if not force and self.last_saved() < 1000:
-            return
         self.save_state_json(self.get_state())
-        self._dirty_save = False
 
     # —— 主循环（microsecond tick 驱动）——
     def main(self):
