@@ -20,7 +20,7 @@ Euclidean2 - 6-channel dual Euclidean sequencer (Digitakt 2 style dual machine)
 即门的触发高电压 (0~10V，默认 5V)。全局时钟统一驱动全部 6 路。
 
 控制：
-  B1            短按：上一页    长按(>500ms)：手动推进一拍（无时钟时试听）
+  B1            短按：上一页    长按(>500ms)：保存状态（唯一触发 save 的途径）
   B2            短按：下一页    长按(>500ms)：回到全局时钟页 (P0)
   同时按住 B1+B2 0.5s：返回菜单（系统行为，本脚本不拦截）
   K1            参数选择（跳转策略，带迟滞）
@@ -52,10 +52,13 @@ UI（128x32）：
     EuroPi 硬件
         │
         ▼
-    Hardware          ← 唯一允许调用 EuroPi API 的模块（硬件抽象）
+    Hardware          ← 唯一允许调用 EuroPi API 的模块（硬件抽象 + 输入采样源）
+                        · 采样层：按键去抖 / 旋钮 1% 死区，产出稳定采样
+                        · 持有 DIN ISR 与时钟事件队列（_clock_q）
         │
         ▼
-    InputManager      ← 硬件状态 → 语义事件 (KnobTurn / ButtonEvent)
+    InputManager      ← 稳定采样 → 语义事件（边沿/长按时序），产出统一事件队列
+                          [KnobTurn, ButtonEvent, ClockEvent]（外部时钟亦走此队列）
         │
         ▼
     Controller         ← Euclidean2：事件分发 + 命令派发 + 触发渲染（几乎无业务）
@@ -168,10 +171,12 @@ MAX_STEPS = 64  # 单发生器序列最大步数
 MIN_STEPS = 1   # 单发生器序列最小步数
 GATE_MS = 5  # 时钟事件后统一拉低输出的延迟（ms）
 T_SHOW_US = 20_000  # 屏幕刷新预留窗口（微秒）；距离下次时钟事件不足该值时跳过刷新
+DEBOUNCE_MS = 30       # 按键去抖窗口（ms）：raw 变化后须连续稳定达此宽才认定状态变更
+KNOB_DEADBAND = 0.01  # 旋钮采样死区（1%）：低于此变化视为 ADC 抖动，保持上次稳定值
 
 
 # ---------------------------------------------------------------------------
-# 语义事件（InputManager → Controller 的通信载体）
+# 语义事件（InputManager.poll() → Controller.dispatch 的通信载体）
 # ---------------------------------------------------------------------------
 
 class KnobTurn:
@@ -192,8 +197,14 @@ class ButtonEvent:
         self.kind = kind
 
 
+class ClockEvent:
+    """外部时钟 tick 事件（DIN 上升沿）。
+    由 Hardware 的时钟队列流出，经 dispatch 驱动 Transport.ext_tick（仅 EXT 源生效）。"""
+    __slots__ = ()
+
+
 # ---------------------------------------------------------------------------
-# Hardware Adapter —— 唯一允许访问 EuroPi 硬件 API 的模块（硬件抽象）
+# Hardware Adapter —— 唯一允许访问 EuroPi 硬件 API 的模块（硬件抽象 + 输入事件源）
 # ---------------------------------------------------------------------------
 
 class Hardware:
@@ -209,23 +220,69 @@ class Hardware:
         self.cv = [cv1, cv2, cv3, cv4, cv5, cv6]
         self.din = din
 
-    # --- 输入读取 ---
+        # —— 输入去抖状态（采样层：只在 Hardware 内，事件层只看到稳定值）——
+        # 按键：经典弹跳滤波——raw 变化后须连续 DEBOUNCE_MS 稳定才更新 state
+        self._btn = {
+            "b1": {"state": False, "pending": False, "t": 0},
+            "b2": {"state": False, "pending": False, "t": 0},
+        }
+        # 旋钮：1% 死区，低于此视为 ADC 抖动，保持上次稳定值
+        self._k1 = None
+        self._k2 = None
+
+        # 外部时钟事件队列（ISR 经 micropython.schedule 推入，由 InputManager 取走）
+        self._clock_q = []
+
+        # 注册 DIN 上升沿 → 往时钟队列推 ClockEvent（外部时钟源时由 dispatch 驱动）
+        self.on_clock_rise(self._push_clock)
+
+    # --- 输入采样（去抖层：产出稳定值）---
+    def _debounced(self, key, raw):
+        d = self._btn[key]
+        now = ticks_ms()
+        if raw != d["state"]:
+            if raw != d["pending"]:
+                d["pending"] = raw
+                d["t"] = now
+            elif ticks_diff(now, d["t"]) >= DEBOUNCE_MS:
+                d["state"] = raw
+        else:
+            d["pending"] = raw
+        return d["state"]
+
     def knob1(self):
-        return self.k1.percent()
+        raw = self.k1.percent()
+        if self._k1 is None or abs(raw - self._k1) >= KNOB_DEADBAND:
+            self._k1 = raw
+        return self._k1
 
     def knob2(self):
-        return self.k2.percent()
+        raw = self.k2.percent()
+        if self._k2 is None or abs(raw - self._k2) >= KNOB_DEADBAND:
+            self._k2 = raw
+        return self._k2
 
     def button1(self):
-        return self.b1.value() == HIGH
+        return self._debounced("b1", self.b1.value() == HIGH)
 
     def button2(self):
-        return self.b2.value() == HIGH
+        return self._debounced("b2", self.b2.value() == HIGH)
+
+    def _push_clock(self, _=None):
+        # 由 DIN ISR 经 micropython.schedule 调用（已脱离中断上下文），安全入队
+        self._clock_q.append(ClockEvent())
+
+    def take_clock_events(self):
+        """取出并清空 ISR 推入的 ClockEvent 列表（由 InputManager 调用，并入事件流）。"""
+        if not self._clock_q:
+            return []
+        q = self._clock_q
+        self._clock_q = []
+        return q
 
     def on_clock_rise(self, cb):
-        # 注册 DIN 上升沿回调（外部时钟源时由 Transport 驱动）。
-        # 中断上下文里只做轻量调度：用 micropython.schedule 把真正的回调推到
-        # 主循环执行，避免在 ISR 中做 CV 输出等重活、并消除与主循环的共享状态竞争。
+        # 注册 DIN 上升沿回调：中断上下文只做轻量调度，把真正的回调推到主循环执行，
+        # 消除与主循环的共享状态竞争（见 _push_clock）。
         def _isr(_):
             try:
                 micropython.schedule(cb, None)
@@ -258,12 +315,13 @@ class Hardware:
 
 
 # ---------------------------------------------------------------------------
-# Input Manager —— 硬件状态 → 语义事件
+# Input Manager —— 硬件稳定采样 → 语义事件（独立于 Hardware 的输入解释层）
 # ---------------------------------------------------------------------------
 
 class InputManager:
-    """把硬件状态转化为语义事件（KnobTurn / ButtonEvent）。
-    不修改任何应用状态；按钮做短按/长按边沿判定。"""
+    """把 Hardware 的稳定采样转化为语义事件（KnobTurn / ButtonEvent / ClockEvent）。
+    不修改任何应用状态；按钮做短按/长按边沿判定。完全独立于平台（只依赖 Hardware
+    接口），可单独单元测试。"""
 
     def __init__(self, hw):
         self.hw = hw
@@ -276,23 +334,25 @@ class InputManager:
         # 复用单例事件对象，避免每轮分配
         self._knob1 = KnobTurn(1, 0.0)
         self._knob2 = KnobTurn(2, 0.0)
-        # 旋钮事件驱动：仅当相对上次发出值变化 >= 1% 时才产生事件
+        # 旋钮事件驱动：仅当稳定采样值变化（>=1% 死区）时才产生事件
         self._knob1_last = -1.0  # -1 强制首轮发出初始状态
         self._knob2_last = -1.0
 
     def poll(self):
+        """统一事件入口：返回本轮所有输入事件 [KnobTurn, ButtonEvent, ClockEvent]。
+        旋钮/按键去抖在 Hardware 采样层完成；这里的边沿/长按时序属“事件层”语义。"""
         events = []
         now = ticks_ms()
         d1 = self.hw.button1()
         d2 = self.hw.button2()
 
         if d1 and d2:
-            # 双按 = 返回菜单（交由系统处理），本管理器不产出事件
+            # 双按 = 返回菜单（交由系统处理），不产出事件，并重置边沿状态
             self._b1_down = d1
             self._b2_down = d2
             return events
 
-        # B1
+        # B1 边沿 + 长按判定
         if d1 and not self._b1_down:
             self._b1_press_t = now
             self._b1_long = False
@@ -304,7 +364,7 @@ class InputManager:
                 events.append(ButtonEvent("B1", "press"))
         self._b1_down = d1
 
-        # B2
+        # B2 边沿 + 长按判定
         if d2 and not self._b2_down:
             self._b2_press_t = now
             self._b2_long = False
@@ -316,17 +376,21 @@ class InputManager:
                 events.append(ButtonEvent("B2", "press"))
         self._b2_down = d2
 
-        # 旋钮：事件驱动，仅当位置变化超过 1% 才发出事件（携带当前值）
+        # 旋钮：事件驱动，仅当稳定采样值变化（>=1% 死区）才发出事件
         v1 = self.hw.knob1()
-        if abs(v1 - self._knob1_last) >= 0.01:
+        if v1 != self._knob1_last:
             self._knob1_last = v1
             self._knob1.value = v1
             events.append(self._knob1)
         v2 = self.hw.knob2()
-        if abs(v2 - self._knob2_last) >= 0.01:
+        if v2 != self._knob2_last:
             self._knob2_last = v2
             self._knob2.value = v2
             events.append(self._knob2)
+
+        # 外部时钟：取走 ISR 推入的 ClockEvent，并入同一事件流
+        for c in self.hw.take_clock_events():
+            events.append(c)
         return events
 
 
@@ -670,8 +734,8 @@ class Euclidean2(EuroPiScript):
         self.input = InputManager(self.hw)
         self.renderer = Renderer()
 
-        # 时钟输入：注册 din 回调；仅在 EXT 时由 Transport.ext_tick 驱动
-        self.hw.on_clock_rise(self.transport.ext_tick)
+        # 时钟输入由 Hardware 自管理：on_clock_rise 已在 Hardware.__init__ 注册，
+        # 外部时钟上升沿经队列作为 ClockEvent 流出，dispatch 中驱动 Transport.ext_tick
         if SAVE_STATES:
             self.load_state()
         # 启动时钟（依据当前 source：默认 INT）
@@ -703,6 +767,9 @@ class Euclidean2(EuroPiScript):
                     self.app.goto_global()
                 else:
                     self.app.next_page()
+        elif isinstance(ev, ClockEvent):
+            # 外部时钟 tick：仅 EXT 源生效（Transport.ext_tick 内含 source 守卫）
+            self.transport.ext_tick()
 
     # —— UI Pages：把交互译为命令（只调用 Transport / Track 的设置器）——
     def _on_knob1(self, p):
