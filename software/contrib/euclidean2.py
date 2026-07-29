@@ -285,7 +285,7 @@ GLOBAL_PARAMS = [
 
 NUM_PAGES = 7  # 0 全局 + 1..6 通道
 
-T_SHOW_US = 18_000  # 屏幕刷新预留窗口（微秒）；距离下次时钟事件不足该值时跳过刷新
+T_SHOW_US = 20_000  # 屏幕刷新预留窗口（微秒）；距离下次时钟事件不足该值时跳过刷新
 DEBOUNCE_MS = 30       # 按键去抖窗口（ms）：raw 变化后须连续稳定达此宽才认定状态变更
 KNOB_DEADBAND = 0.01  # 旋钮事件阈值（1%）：InputManager 据此判定旋钮变化是否足以产生 KnobTurn 事件（去除 Hardware 内增量保持后，由事件层承担抑抖/降事件率）
 
@@ -677,7 +677,7 @@ class Track:
         on1 = self._active(self.g1, self.g1_pos)
         on2 = self._active(self.g2, self.g2_pos)
         out = combine_outputs(on1, on2, self.merge)
-        self.last_out = out  # 记录当前步触发状态，供屏幕左下角指示
+        self.last_out = out  # 记录当前步触发状态，供屏幕底部唱头行显示
         return out
 
     # —— 序列化（模型自管，Controller 只做编排）——
@@ -744,6 +744,7 @@ class Transport:
         self.level = 5  # 全局输出 CV 电平（0~10V）
         self.source = "INT"
         self.running = False
+        self.beat_index = 0  # 全局已发生节拍数（第 k 拍后 = k），供显示唱头分页对齐
         self.next_clock_us = 0  # 下一次内部时钟事件应发生的 tick（us）
 
     def beat_us(self):
@@ -754,6 +755,7 @@ class Transport:
     def start(self):
         # 重置相位：下一次时钟事件安排在 beat_us 之后
         self.next_clock_us = ticks_add(ticks_us(), self.beat_us())
+        self.beat_index = 0  # 唱头从 0 起步
         self.running = True
 
     def stop(self):
@@ -766,6 +768,7 @@ class Transport:
             return
         if ticks_diff(now_us, self.next_clock_us) >= 0:
             self._on_tick()
+            self.beat_index += 1  # 已发生一拍（在 tick 之后累加，保证与 pos/last_out 同相）
             # 重新锚定到当前时刻之后一个 beat，丢弃所有错过的 tick
             self.next_clock_us = ticks_add(now_us, self.beat_us())
 
@@ -779,6 +782,7 @@ class Transport:
         # 仅在外部时钟源时由 din 上升沿驱动（INT 时忽略）
         if self.source == "EXT":
             self._on_tick()
+            self.beat_index += 1  # 已发生一拍（与 pos/last_out 同相）
 
     def set_source(self, src):
         if src == self.source:
@@ -869,26 +873,35 @@ class Renderer:
         if app.page == 0:
             self._draw_global(app, transport, hw)
         else:
-            self._draw_channel(app, seq.tracks[app.page - 1], hw)
+            self._draw_channel(app, seq.tracks[app.page - 1], transport, hw)
         hw.display_show()
 
     def _draw_global(self, app, transport, hw):
-        # 全局时钟页只显示顶栏（P0 CLK:.. / P0 BPM:.. / P0 MUL:.. / P0 LVL:..），其余行留空；
+        # 全局时钟页只显示顶栏：页标记右上角，参数左上角；其余行留空。
         # P0 无对应 track，左下角不绘制触发指示。显示完全由 GLOBAL_PARAMS 表驱动。
         abbr, _, _, _, _, _, fmt = GLOBAL_PARAMS[app.sel]
-        hw.display_text(f"P0 {abbr}:{fmt(transport)}", 0, 0)
+        page_str = f"P{app.page}"
+        hw.display_text(page_str, OLED_WIDTH - len(page_str) * 8, 0)  # 右上角页标记
+        hw.display_text(f"{abbr}:{fmt(transport)}", 0, 0)            # 左上角参数（左对齐）
 
-    def _draw_channel(self, app, track, hw):
+    def _draw_channel(self, app, track, transport, hw):
         abbr, kind = CH_PARAMS[app.sel]
         if kind == "merge":
             val = MERGE_MODES[track.merge]
         else:
             val = self._param_value(track, kind)
-        hw.display_text(f"P{app.page} {abbr}:{val}", 0, 0)
-        self._draw_seq_row(track.g1, track.g1_pos, 8, hw)
-        self._draw_seq_row(track.g2, track.g2_pos, 16, hw)
-        # 左下角指示：当前步（本通道）的触发状态
-        self._draw_step_indicator(track.last_out, hw)
+        page_str = f"P{app.page}"
+        hw.display_text(page_str, OLED_WIDTH - len(page_str) * 8, 0)  # 右上角页标记
+        hw.display_text(f"{abbr}:{val}", 0, 0)                        # 左上角参数（左对齐）
+        # 全局 16 步窗口：按 beat_index 以 16 步分页（满 16 步翻到下一页）。
+        # 序列长度 ≠ 16 时循环补足 16 列；两序列共用同一窗口偏移，唱头对齐二者。
+        bi = transport.beat_index
+        cur = bi - 1 if bi > 0 else 0          # 当前全局步（0 基）
+        wstart = (cur // 16) * 16              # 当前 16 步页起点
+        self._draw_seq_row(track.g1, 8, wstart, hw)
+        self._draw_seq_row(track.g2, 16, wstart, hw)
+        # 底部唱头：随节拍向右，仅唱头所在列显示方块(触发)/点(未触发)
+        self._draw_playhead(track, cur % 16, 26, hw)
 
     def _param_value(self, track, kind):
         mapping = {
@@ -903,22 +916,22 @@ class Renderer:
         }
         return mapping.get(kind, "")
 
-    def _draw_seq_row(self, gen, pos, y, hw):
-        # 当前步固定 col0，向右取至多 16 格；序列步数 < 16 则只显示实际步数
-        for i in range(min(16, gen.steps)):
-            idx = (pos + i) % gen.steps
-            x = i * 8
+    def _draw_seq_row(self, gen, y, wstart, hw):
+        # 16 列窗口（8px/列，整屏宽度）：列 c 对应全局步 (wstart + c)。
+        # 序列长度 < 16 → 循环补足 16 列；> 16 → 显示连续 16 步；下一页由调用方推进 wstart。
+        for c in range(16):
+            idx = (wstart + c) % gen.steps
             if gen.pattern[idx]:
-                hw.display_fill_rect(x, y, 6, 6, 1)
+                hw.display_fill_rect(c * 8, y, 6, 6, 1)      # 触发步：实心方块
             else:
-                hw.display_fill_rect(x + 2, y + 2, 2, 2, 1)
+                hw.display_fill_rect(c * 8 + 2, y + 2, 2, 2, 1)  # 非触发：点
 
-    def _draw_step_indicator(self, on, hw):
-        # 屏幕最左下角：实心方块 = 当前步触发，点 = 未触发
-        if on:
-            hw.display_fill_rect(0, 26, 6, 6, 1)
+    def _draw_playhead(self, track, play_pos, y, hw):
+        # 仅唱头所在列显示：触发→实心方块，未触发→点；其余列留空（无滚动窗口噪声）
+        if track.last_out:
+            hw.display_fill_rect(play_pos * 8, y, 6, 6, 1)
         else:
-            hw.display_fill_rect(2, 28, 2, 2, 1)
+            hw.display_fill_rect(play_pos * 8 + 2, y + 2, 2, 2, 1)
 
 # ---------------------------------------------------------------------------
 # Controller / Application —— 事件分发 + 命令派发 + 触发渲染（几乎无业务逻辑）
