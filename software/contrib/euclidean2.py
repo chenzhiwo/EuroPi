@@ -129,6 +129,94 @@ SAVE_STATES = True
 
 
 # ---------------------------------------------------------------------------
+# 性能分析（全局开关 + 统计器）
+# ---------------------------------------------------------------------------
+PROFILE = True  # 性能分析总开关：置 False 即完全禁用（不计时、不打印、零开销）
+
+class _NullProfiler:
+    """PROFILE=False 时的空实现：相同接口但全部空操作，运行期开销可忽略。"""
+    class _NullSection:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def section(self, name): return self._NullSection()
+    def record(self, name, dt_us): pass
+    def maybe_print(self, now_us): pass
+    def print_stats(self): pass
+
+
+class _ProfSection:
+    """`with PROFILER.section("name"):` 测量该代码块耗时（us），退出时记录。"""
+    __slots__ = ("_p", "_name", "_t")
+    def __init__(self, p, name):
+        self._p = p
+        self._name = name
+        self._t = ticks_us()
+    def __enter__(self): return self
+    def __exit__(self, *exc):
+        self._p.record(self._name, ticks_diff(ticks_us(), self._t))
+        return False
+
+
+class Profiler:
+    """关键路径耗时统计器（MicroPython 友好，基于 utime.ticks_us）。
+
+    按 name 区分累计每类代码块：调用次数、总耗时、当前此次耗时、历史最大耗时；
+    每 1 秒经串口打印：当前此次 / 平均 / 历史最大。生命周期由全局 PROFILE 开关控制。
+    """
+    def __init__(self):
+        self._stats = {}        # name -> [count, total_us, last_us, max_us]
+        self._last_print_us = 0
+        self._start_us = ticks_us()
+        self._warmed = False    # 启动后前 1s 为预热期，样本不计入统计
+
+    def section(self, name):
+        return _ProfSection(self, name)
+
+    def record(self, name, dt_us):
+        s = self._stats.get(name)
+        if s is None:
+            # [last_us, max_us(历史), win_count, win_total]
+            self._stats[name] = [dt_us, dt_us, 1, dt_us]
+        else:
+            s[0] = dt_us          # 当前此次耗时
+            if dt_us > s[1]:
+                s[1] = dt_us      # 历史最大耗时（跨 1s 窗口保留）
+            s[2] += 1             # 过去 1s 窗口内次数
+            s[3] += dt_us         # 过去 1s 窗口内总耗时
+
+    def maybe_print(self, now_us):
+        # 启动后前 1s 为预热期：丢弃其样本，避免初始误差污染统计
+        if not self._warmed:
+            if now_us - self._start_us >= 1_000_000:
+                self._warmed = True
+                self._stats = {}          # 丢弃预热期累计
+                self._last_print_us = now_us
+            return
+        # 预热结束后每 ~1s 输出一次（用 ticks 差值，自动处理 71 分钟回绕）
+        if now_us - self._last_print_us >= 1_000_000:
+            self._last_print_us = now_us
+            self.print_stats()
+            # 重置 1s 窗口累计（max 保留），下一窗口重新统计平均值
+            for s in self._stats.values():
+                s[2] = 0
+                s[3] = 0
+
+    def print_stats(self):
+        if not self._stats:
+            return
+        parts = []
+        for name, s in self._stats.items():
+            last, mx, n, tot = s
+            avg = (tot / n) / 1000 if n else 0  # us -> ms，过去 1s 窗口均值
+            parts.append("%s cur=%.2f avg=%.2f max=%.2f ms (n=%d)"
+                         % (name, last / 1000, avg, mx / 1000, n))
+        print("PROF:", " | ".join(parts))
+
+
+PROFILER = Profiler() if PROFILE else _NullProfiler()
+
+
+# ---------------------------------------------------------------------------
 # 配置与纯函数（与硬件无关）
 # ---------------------------------------------------------------------------
 
@@ -197,7 +285,7 @@ GLOBAL_PARAMS = [
 
 NUM_PAGES = 7  # 0 全局 + 1..6 通道
 
-T_SHOW_US = 20_000  # 屏幕刷新预留窗口（微秒）；距离下次时钟事件不足该值时跳过刷新
+T_SHOW_US = 18_000  # 屏幕刷新预留窗口（微秒）；距离下次时钟事件不足该值时跳过刷新
 DEBOUNCE_MS = 30       # 按键去抖窗口（ms）：raw 变化后须连续稳定达此宽才认定状态变更
 KNOB_DEADBAND = 0.01  # 旋钮事件阈值（1%）：InputManager 据此判定旋钮变化是否足以产生 KnobTurn 事件（去除 Hardware 内增量保持后，由事件层承担抑抖/降事件率）
 
@@ -870,7 +958,8 @@ class Euclidean2(EuroPiScript):
 
     # —— 节拍（ClockTick 事件）——
     def _on_beat(self):
-        self.seq.tick(self.transport.level)
+        with PROFILER.section("on_beat"):
+            self.seq.tick(self.transport.level)
         self.app.dirty = True
 
     # —— 事件分发（Controller 的职责之一）——
@@ -1005,18 +1094,24 @@ class Euclidean2(EuroPiScript):
     def main(self):
         while True:
             now_us = ticks_us()
-            # 内部时钟 / 门控关闭：到达应发生的 tick 时由主循环触发
-            self.transport.update(now_us)
-            self.seq.update(now_us)
-            for ev in self.input.poll():
-                self.dispatch(ev)
-            # 屏幕刷新：预留 t_show，距离下次时钟事件 < t_show 时跳过，避免抢占时钟精度
-            if self.app.dirty:
-                gap = self.transport.time_to_next_clock_us(now_us)
-                if gap is None or gap >= T_SHOW_US:
-                    self.renderer.render(self.app, self.seq, self.transport, self.hw)
-                    self.app.dirty = False
+            with PROFILER.section("loop"):
+                # 内部时钟 / 门控关闭：到达应发生的 tick 时由主循环触发
+                self.transport.update(now_us)
+                self.seq.update(now_us)
+                with PROFILER.section("poll"):
+                    events = self.input.poll()
+                for ev in events:
+                    with PROFILER.section("dispatch"):
+                        self.dispatch(ev)
+                # 屏幕刷新：预留 t_show，距离下次时钟事件 < t_show 时跳过，避免抢占时钟精度
+                if self.app.dirty:
+                    gap = self.transport.time_to_next_clock_us(now_us)
+                    if gap is None or gap >= T_SHOW_US:
+                        with PROFILER.section("render"):
+                            self.renderer.render(self.app, self.seq, self.transport, self.hw)
+                        self.app.dirty = False
             time.sleep_ms(0)
+            PROFILER.maybe_print(now_us)
 
 
 if __name__ == "__main__":
