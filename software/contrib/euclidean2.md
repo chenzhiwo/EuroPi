@@ -103,25 +103,37 @@ P0 全局时钟 → P1 CH1 → P2 CH2 → P3 CH3 → P4 CH4 → P5 CH5 → P6 CH
   状态（每次启动都用默认/初始参数），也不在运行中写盘，避免阻塞式写 flash 造成的卡顿。
   需要保留参数时改回 `True`。
 
-## 内部架构（单文件分层，参照 ARCHITECTURE.md）
+## 内部架构（单文件分层，参照 ARCHITECTURE.md 与 Refactoring Plan）
 
 代码保持为**单个文件**，但内部按 `europi-ws/ARCHITECTURE.md` 的原则严格分层；各层只通过
-「语义事件 / 命令 / 模型读取」交互，绝不直接互相改状态，且 Sequencer / Pattern / Track /
-Transport 中**不出现任何 EuroPi API 调用**：
+「语义事件 / 命令 / 模型读取 / 输出事件」交互，绝不直接互相改状态，且 Sequencer / Pattern /
+Track / Transport 中**不出现任何 EuroPi API 调用**：
 
 | 层 | 类 | 职责 | 单一事实来源 |
 | --- | --- | --- | --- |
-| Hardware Adapter | `Hardware` | 唯一访问 `oled/k1/k2/b1/b2/cv*/din` 的模块 | — |
-| Input Manager | `InputManager` | 硬件状态 → 语义事件（`KnobTurn` / `ButtonEvent`） | — |
-| Controller | `Euclidean2` | 事件分发 + 命令派发 + 触发渲染（几乎无业务） | — |
-| UI Pages | `Euclidean2._edit_*` / `_on_knob*` | 把交互译为命令，只调 Transport / Track 设置器 | — |
-| ApplicationState | `AppState` | 仅 UI 状态（当前页 / 选中项 / K2 拾取） | UI 状态 |
-| Sequencer Core | `EuclidPattern` / `Track` / `Sequencer` | `Pattern`=音乐内容；`Track`=TrackSettings+TrackPlayer；`Sequencer`=分发 ClockTick 并产出输出事件 | 音乐数据 |
+| Hardware Adapter | `Hardware` | 唯一访问 `oled/k1/k2/b1/b2/cv*/din` 的模块；将输出事件 apply 到物理 CV/Gate；持有 DIN ISR 与时钟事件队列 | — |
+| Input Manager | `InputManager` | 稳定采样 → 语义事件（`KnobTurn` / `ButtonEvent` / `ClockEvent`） | — |
+| Output Events | `OutputEvent` → `CVOutputEvent` / `GateOutputEvent` / `ClockOutputEvent` | Sequencer Core → Controller 的通信载体（硬件无关） | — |
+| Commands | `Command` 子类 | Controller → Model 的通信载体（与输入事件对称） | — |
+| Application | `Euclidean2`(EuroPiScript) | 装配 Hardware / 模型 / Controller；状态持久化 | — |
+| Controller | `Controller` | 事件分发 + 命令派发（`_exec` 统一出口）+ 主循环（几乎无业务） | — |
+| UI Pages | `Pages` | 把交互译为命令，只产出 `Command`，不直改模型 | — |
+| ApplicationState | `AppState` | 仅 UI 状态（当前页 / 选中项 / K2 拾取 / dirty） | UI 状态 |
+| Sequencer Core | `Pattern`(接口) / `EuclidPattern` / `TrackSettings` / `TrackPlayer` / `Track` / `Sequencer` | `Pattern`=音乐内容(what)；`TrackSettings`=播放配置(how)；`TrackPlayer`=播放头/相位(where)；`Sequencer`=分发 ClockTick 并产出**输出事件** | 音乐数据 |
 | Transport | `Transport` | 全局时间：BPM / 倍率 mul / 输出电压 level / 时钟源 / 运行状态 | 时间 |
-| Renderer | `Renderer` | 无状态：读模型、经 Hardware 绘制，不修改、不持有持久数据 | — |
+| ViewModel | `SequencerViewModel` | 渲染用视图模型：把模型读数翻译为渲染就绪视图（唱头分页 / 参数取值） | — |
+| Renderer | `Renderer` | 无状态：读 ViewModel、经 Hardware 绘制，不修改、不持有持久数据 | — |
+
+关键约束（来自重构计划 6 步）：
+- **Sequencer 与硬件解耦**：`Sequencer` 不持有 Hardware，每个 ClockTick 产出 `GateOutputEvent` /
+  `CVOutputEvent` 等语义事件；门控「GATE_MS 后拉低」以定时输出事件在内部调度（`Sequencer.pump` 取走）。
+- **Pattern 接口**：`Pattern` 为抽象接口；`EuclidPattern` 是其实现。Sequencer 只依赖接口，新增算法只需新增子类。
+- **Track 三层拆分**：`Track = Pattern ×2 + TrackSettings + TrackPlayer`，分别回答「演奏什么 / 怎么播 / 播到哪」。
+- **Application / Controller / Pages 分离**：装配与持久化在 `Euclidean2`；事件分发/主循环在 `Controller`；交互→命令在 `Pages`。
+- **ViewModel 渲染**：`Renderer` 经 `SequencerViewModel` 读模型，不做状态判断。
 
 数据流：`硬件 → Hardware → InputManager(事件) → Controller → [UI Pages 命令 → Transport/Track] / [ClockTick → Sequencer → 输出事件 → Hardware]`；
-渲染由 Controller 在「脏」时调用 `Renderer.render(app, seq, transport, hw)`。
+渲染由 Controller 在「脏」时经 `Renderer.render(..., hw)` 调用，`Renderer` 经 `SequencerViewModel` 读 AppState + Sequencer/Transport。
 换硬件平台只需重写 `Hardware` 适配器，其余层保持不变。
 
 ## 实现要点（对应 euclidean2_dev.md）

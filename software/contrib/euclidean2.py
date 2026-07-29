@@ -44,40 +44,42 @@ UI（128x32）：
   行2 Gen2 序列，同左锚定前瞻滚动窗（最多 16 步，超出按播放头左滚）
 
 --------------------------------------------------------------------------------
-单文件分层架构（参照 europi-ws/ARCHITECTURE.md 的亮点，受"保持单文件"约束）
+重构后的分层架构（依据 EuroPi_Sequencer_Refactoring_Plan.md 的 6 个步骤）
 --------------------------------------------------------------------------------
-本文件刻意保持为**单个脚本**，但内部按 ARCHITECTURE.md 的架构原则严格分层，
-各层之间只通过「语义事件 / 命令 / 模型读取」交互，不直接互相改状态：
+本文件刻意保持为**单个脚本**，但严格按重构计划分层。各层只通过「语义事件 /
+命令 / 模型读取 / 输出事件」交互，不直接互相改状态：
 
     EuroPi 硬件
         │
         ▼
     Hardware          ← 唯一允许调用 EuroPi API 的模块（硬件抽象 + 输入采样源）
-                        · 采样层：仅按键去抖（轮询态式）产出稳定值；旋钮稳定采样交 europi（percent 过采样），消抖阈值由 InputManager 事件层（KNOB_DEADBAND）承担
-                        · 持有 DIN ISR 与时钟事件队列（_clock_q）
+        │                · 采样层：仅按键去抖（轮询态式）产出稳定值
+        │                · 持有 DIN ISR 与时钟事件队列（_clock_q）
+        │                · 输出落点：将输出事件 apply 到物理 CV/Gate
+        ▼
+    InputManager      ← 稳定采样 → 语义输入事件（边沿/长按时序）
+                          [KnobTurn, ButtonEvent, ClockEvent]
         │
         ▼
-    InputManager      ← 稳定采样 → 语义事件（边沿/长按时序），产出统一事件队列
-                          [KnobTurn, ButtonEvent, ClockEvent]（外部时钟亦走此队列）
-        │
-        ▼
-    Controller         ← Euclidean2：事件分发 + 命令派发（_exec 统一出口）+ 触发渲染
-        ├─→ 命令 Command ← 与输入侧事件对称的「输出载体」：SetBpm/SetTrackParam/…
-        │                  所有模型变更经 _exec(cmd) 执行（改模型 + 置 dirty）
+    Controller         ← Euclidean2：事件分发 + 命令派发（_exec 统一出口）+ 主循环
         ├─→ UI Pages   ← 把交互译为命令（产出 Command，不直改模型）
         ├─→ AppState   ← 仅 UI 状态（当前页 / 选中项 / K2 拾取）
-        ├─→ Sequencer  ← 拥有演奏：接收 ClockTick → 分发给各 Track → 输出事件
-        │      ├─ EuclidPattern  ← Pattern：单个发生器的音乐内容 (what)；自管 to_dict/from_dict
-        │      └─ Track          ← TrackSettings + TrackPlayer；自管 to_dict/from_dict
-        └─→ Transport   ← 拥有全局时间：BPM / 时钟源 / 运行状态 (when)；自管 to_dict/from_dict
+        ├─→ Sequencer  ← 拥有演奏：接收 ClockTick → 分发给各 TrackPlayer
+        │      │          → 产出「输出事件」(硬件无关)
+        │      ├─ EuclidPattern  ← Pattern 接口实现：单个发生器的音乐内容 (what)
+        │      ├─ TrackSettings  ← 播放配置 (how)：merge（+ 预留 length/div/dir…）
+        │      └─ TrackPlayer    ← 运行时播放头/相位 (where)
+        └─→ Transport   ← 拥有全局时间：BPM / 时钟源 / 运行状态 (when)
         │
         ▼
-    Renderer           ← 无状态渲染：读 AppState + Sequencer/Transport，经 Hardware 绘制
+    Renderer           ← 无状态渲染：经 ViewModel 读 AppState + Sequencer/Transport，
+                          再经 Hardware 绘制（不修改、不持有持久 UI 数据）
 
-关键约束（来自 ARCHITECTURE.md）：
+关键约束（来自重构计划）：
   * Sequencer / Pattern / Track / Transport 绝不出现 oled/k1/cv1 等 EuroPi 调用；
-    它们只产生语义输出（如 hw.set_cv(idx, v)），由 Hardware 适配器落盘到硬件。
-  * Renderer 是无状态的纯函数：只读模型、不修改、不持有持久 UI 数据。
+    它们只产生语义输出事件（GateOutputEvent / CVOutputEvent / ClockOutputEvent），
+    由 Controller 经 Hardware 适配器 apply 到物理输出。
+  * Renderer 是无状态的：只读模型、经 ViewModel 取值、不修改状态、不持有持久数据。
   * 单一事实来源：Pattern 是音乐数据唯一来源，Transport 是时间唯一来源，
     AppState 是 UI 状态唯一来源；不跨层复制信息。
   * 换平台只需重写 Hardware 适配器，其余层保持不变。
@@ -291,7 +293,7 @@ KNOB_DEADBAND = 0.01  # 旋钮事件阈值（1%）：InputManager 据此判定�
 
 
 # ---------------------------------------------------------------------------
-# 语义事件（InputManager.poll() → Controller.dispatch 的通信载体）
+# 语义输入事件（InputManager.poll() → Controller.dispatch 的通信载体）
 # ---------------------------------------------------------------------------
 
 class KnobTurn:
@@ -315,6 +317,41 @@ class ButtonEvent:
 class ClockEvent:
     """外部时钟 tick 事件（DIN 上升沿）。
     由 Hardware 的时钟队列流出，经 dispatch 驱动 Transport.ext_tick（仅 EXT 源生效）。"""
+    __slots__ = ()
+
+
+# ---------------------------------------------------------------------------
+# 语义输出事件（Sequencer Core → Controller → Hardware 的通信载体，硬件无关）
+# ---------------------------------------------------------------------------
+
+class OutputEvent:
+    """输出事件基类：Sequencer Core 在每次推进时产出的语义输出。
+    不含任何硬件调用；由 Controller 经 Hardware 适配器 apply 到物理输出。"""
+    pass
+
+
+class CVOutputEvent(OutputEvent):
+    """某 CV 通道置为指定电压（硬件无关；电平由 Sequencer 计算后携带）。"""
+    __slots__ = ("channel", "voltage")
+
+    def __init__(self, channel, voltage):
+        self.channel = channel
+        self.voltage = voltage
+
+
+class GateOutputEvent(OutputEvent):
+    """某 Gate/CV 通道的触发状态（True=触发高电平，False=拉低）。
+    本脚本中每通道的 CV 即门，故主要使用此事件；高电平电压由 Hardware 适配器的
+    gate_level 决定（与全局输出电压同步）。"""
+    __slots__ = ("channel", "state")
+
+    def __init__(self, channel, state):
+        self.channel = channel
+        self.state = state
+
+
+class ClockOutputEvent(OutputEvent):
+    """时钟输出脉冲事件（框架词汇；当前脚本无独立时钟输出引脚，故不主动产生）。"""
     __slots__ = ()
 
 
@@ -397,6 +434,9 @@ class Hardware:
         self.cv = [cv1, cv2, cv3, cv4, cv5, cv6]
         self.din = din
 
+        # 门触发高电平（与全局输出电压同步；Setter 在每次节拍/改电平时刷新）
+        self._gate_level = 5
+
         # —— 输入去抖状态（采样层：只在 Hardware 内，事件层只看到稳定值）——
         # 按键：经典弹跳滤波——raw 变化后须连续 DEBOUNCE_MS 稳定才更新 state
         self._btn = {
@@ -469,6 +509,17 @@ class Hardware:
         pin.irq(trigger=pin.IRQ_FALLING, handler=_isr)
 
     # --- CV / Gate 输出（输出事件的落点）---
+    def set_gate_level(self, v):
+        """设置门触发高电平（全局输出电压）；后续 GateOutputEvent(True) 据此置 CV。"""
+        self._gate_level = v
+
+    def set_gate(self, idx, state):
+        """将某个通道的 Gate（在本脚本中即 CV 门）置为触发/拉低。"""
+        if state:
+            self.cv[idx].voltage(self._gate_level)
+        else:
+            self.cv[idx].off()
+
     def set_cv(self, idx, voltage):
         self.cv[idx].voltage(voltage)
 
@@ -573,12 +624,37 @@ class InputManager:
 
 
 # ---------------------------------------------------------------------------
-# Sequencer Core —— Pattern / TrackPlayer / Sequencer（不含任何硬件调用）
+# Sequencer Core —— Pattern / TrackSettings / TrackPlayer / Sequencer
+# （不含任何硬件调用；产出语义输出事件）
 # ---------------------------------------------------------------------------
 
-class EuclidPattern:
-    """Pattern：单个欧几里得发生器的音乐内容（what to play）。
-    不含运行时播放头（pos 由 TrackPlayer / Track 持有）。"""
+class Pattern:
+    """Pattern 接口（重构计划步骤 4）：单个发生器的音乐内容（what to play）。
+    具体算法（如欧几里得）实现本接口。所有 Sequencer 只依赖此接口，
+    不依赖具体算法——更换/新增算法只需新增 Pattern 子类。"""
+
+    steps = 1
+    pattern = []
+
+    def regenerate(self):
+        """根据 steps/pulses/rot 等参数重新生成 pattern[]。"""
+        raise NotImplementedError
+
+    def output(self, pos):
+        """返回播放头位于 pos 时该步是否应触发（已含概率等「音乐」判定）。"""
+        raise NotImplementedError
+
+    def to_dict(self):
+        raise NotImplementedError
+
+    def from_dict(self, d):
+        raise NotImplementedError
+
+
+class EuclidPattern(Pattern):
+    """EuclidPattern：欧几里得发生器的音乐内容（what to play）。
+    不含运行时播放头（pos 由 TrackPlayer 持有）。概率作为「音乐数据」在此判定，
+    不影响存储序列。"""
 
     def __init__(self, steps, pulses, rot, prob):
         self.steps = steps
@@ -590,6 +666,16 @@ class EuclidPattern:
 
     def regenerate(self):
         self.pattern = generate_euclidean_pattern(self.steps, self.pulses, self.rot)
+
+    def output(self, pos):
+        """该播放头步是否应触发（pattern 且通过概率保留判定）。"""
+        if not self.pattern[pos]:
+            return False
+        if self.prob >= 100:
+            return True
+        if self.prob <= 0:
+            return False
+        return random.random() < self.prob / 100.0
 
     def set_steps(self, steps):
         self.steps = min(max(steps, MIN_STEPS), MAX_STEPS)
@@ -627,21 +713,94 @@ class EuclidPattern:
         self.regenerate()  # 统一重算一次，消除「哪些字段需 regenerate」的隐式知识
 
 
+class TrackSettings:
+    """TrackSettings（重构计划步骤 3）：播放配置（how should it be played）。
+    当前持有 merge（合并模式）。预留 length / clock_division / direction /
+    swing / mute / transpose 等通用字段位（按计划语义），本脚本未全部启用以免
+    改变既有行为；统一在此自管序列化。"""
+
+    def __init__(self, merge=MERGE_OR):
+        self.merge = merge
+
+    # —— 序列化（模型自管，Track 只做编排）——
+    def to_dict(self):
+        return {"merge": self.merge}
+
+    def from_dict(self, d):
+        if not d:
+            return
+        self.merge = d.get("merge", self.merge)
+
+
+class TrackPlayer:
+    """TrackPlayer（重构计划步骤 3）：运行时状态（where are we playing）。
+    持有每路发生器的播放头与当前步触发状态；推进时按合并+概率计算 ON/OFF。
+    不含任何音乐内容（那在 Pattern）也不含播放配置（那在 TrackSettings）。"""
+
+    def __init__(self, patterns, settings):
+        self.patterns = patterns
+        self.settings = settings
+        self.positions = [p.steps - 1 for p in patterns]  # 首次 advance 后落于 0
+        self.last_out = False  # 当前步（最近一次时钟事件）的触发状态
+
+    def output(self):
+        """推进一拍：各播放头前进，按合并+概率计算 ON/OFF。
+        返回该通道本拍是否触发（True/False）。"""
+        ons = []
+        for i, p in enumerate(self.patterns):
+            self.positions[i] = (self.positions[i] + 1) % p.steps
+            ons.append(p.output(self.positions[i]))
+        out = combine_outputs(ons[0], ons[1], self.settings.merge)
+        self.last_out = out  # 记录当前步触发状态，供屏幕底部唱头行显示
+        return out
+
+    # —— 序列化（运行时状态；通常不持久化，但自管以便可选保存）——
+    def to_dict(self):
+        return {"positions": list(self.positions), "last_out": self.last_out}
+
+    def from_dict(self, d):
+        if not d:
+            return
+        pos = d.get("positions")
+        if pos:
+            self.positions = pos
+        self.last_out = d.get("last_out", self.last_out)
+
+
 class Track:
-    """Track = Pattern × 2 + TrackSettings + TrackPlayer（一个通道）。
-    - Pattern:    g1 / g2 的欧几里得序列（steps/pulses/rot/prob + pattern[]）
+    """Track = Pattern × 2 + TrackSettings + TrackPlayer（一个通道，重构计划步骤 3）。
+    - Pattern:      g1 / g2 的欧几里得序列（steps/pulses/rot/prob + pattern[]）
     - TrackSettings: merge（输出电压为全局项，见 Transport.level）
     - TrackPlayer:  g1_pos / g2_pos 播放头（输出由 g1/g2 合并直接计算，无移位寄存器）
+    为兼容既有渲染/页面代码，暴露 g1 / g2 / merge / last_out 便捷访问。
     """
 
     def __init__(self, cv_index, g1, g2, merge):
         self.cv_index = cv_index
-        self.g1 = g1
-        self.g2 = g2
-        self.merge = merge
-        self.g1_pos = g1.steps - 1  # 首次 advance 后落于 0
-        self.g2_pos = g2.steps - 1
-        self.last_out = False  # 当前步（最近一次时钟事件）的触发状态
+        self.patterns = [g1, g2]            # 音乐内容（双机器）
+        self.settings = TrackSettings(merge) # 播放配置
+        self.player = TrackPlayer(self.patterns, self.settings)  # 运行时
+
+    # —— 便捷访问（保持渲染/页面对原字段名的引用）——
+    @property
+    def g1(self):
+        return self.patterns[0]
+
+    @property
+    def g2(self):
+        return self.patterns[1]
+
+    @property
+    def merge(self):
+        return self.settings.merge
+
+    @merge.setter
+    def merge(self, v):
+        self.settings.merge = v
+
+    @property
+    def last_out(self):
+        return self.player.last_out
 
     # —— TrackSettings 命令（由 UI 页译为命令后调用）——
     def set_gen(self, which, attr, val):
@@ -656,75 +815,66 @@ class Track:
             g.set_prob(val)
 
     def set_merge(self, val):
-        self.merge = val
+        self.settings.merge = val
 
-    # —— TrackPlayer 运行时 ——
-    def _active(self, gen, pos):
-        """该播放头步是否应触发（pattern 且通过概率保留判定）。"""
-        if not gen.pattern[pos]:
-            return False
-        if gen.prob >= 100:
-            return True
-        if gen.prob <= 0:
-            return False
-        return random.random() < gen.prob / 100.0
-
+    # —— TrackPlayer 运行时（Sequencer 经此推进）——
     def output(self):
-        """推进一拍：两路播放头前进，按合并+概率计算 ON/OFF。
-        返回该通道本拍是否触发（True/False）；由调用方翻译为 CV/Gate 输出事件。"""
-        self.g1_pos = (self.g1_pos + 1) % self.g1.steps
-        self.g2_pos = (self.g2_pos + 1) % self.g2.steps
-        on1 = self._active(self.g1, self.g1_pos)
-        on2 = self._active(self.g2, self.g2_pos)
-        out = combine_outputs(on1, on2, self.merge)
-        self.last_out = out  # 记录当前步触发状态，供屏幕底部唱头行显示
-        return out
+        return self.player.output()
 
     # —— 序列化（模型自管，Controller 只做编排）——
     def to_dict(self):
         return {"g1": self.g1.to_dict(), "g2": self.g2.to_dict(),
-                "merge": self.merge}
+                "merge": self.settings.merge}
 
     def from_dict(self, d):
         if not d:
             return
         self.g1.from_dict(d.get("g1", {}))
         self.g2.from_dict(d.get("g2", {}))
-        self.merge = d.get("merge", self.merge)
+        self.settings.merge = d.get("merge", self.settings.merge)
 
 
 class Sequencer:
-    """Sequencer：拥有演奏。接收 ClockTick（来自 Transport），分发给各 TrackPlayer，
-    并将结果翻译为 CV/Gate 输出事件，经 Hardware Adapter 应用到物理输出。
-    自身不接触任何 EuroPi API，也不依赖 Transport（电平由 tick(level) 传入）。"""
+    """Sequencer（重构计划步骤 1 & 2）：拥有演奏。接收 ClockTick（来自 Transport
+    或外部时钟），分发给各 TrackPlayer，并将结果翻译为**语义输出事件**
+    （GateOutputEvent / CVOutputEvent / ClockOutputEvent）。
+    自身不接触任何 EuroPi API，也不持有 Hardware 引用——完全硬件无关。
+    门的「GATE_MS 后拉低」以定时输出事件形式在内部调度，由 Controller.pump 取出 apply。
+    """
 
-    def __init__(self, hw):
-        self.hw = hw
+    def __init__(self):
         self.tracks = []
-        self.next_gate_off_us = None  # 下一次统一拉低门应发生的 tick（us）；None=无待办
+        self._scheduled = []  # [(due_us, OutputEvent), ...] 待发输出事件（如门控关闭）
 
     def add_track(self, track):
         self.tracks.append(track)
 
-    def tick(self, level):
-        """一个 ClockTick：推进全部通道并刷新门输出。level=全局输出电压。"""
+    def tick(self, now_us):
+        """一个 ClockTick：推进全部通道并产出本轮输出事件。
+        触发通道额外调度一个 GATE_MS 后的 GateOutputEvent(channel, False) 以自动拉低。"""
+        events = []
         for t in self.tracks:
             on = t.output()
             if on:
-                self.hw.set_cv(t.cv_index, level)
+                events.append(GateOutputEvent(t.cv_index, True))
+                self._scheduled.append(
+                    (ticks_add(now_us, GATE_MS * 1000), GateOutputEvent(t.cv_index, False))
+                )
             else:
-                self.hw.off_cv(t.cv_index)
-        # 统一在 GATE_MS 后拉低所有门（由主循环 update() 触发）
-        self.next_gate_off_us = ticks_add(ticks_us(), GATE_MS * 1000)
+                events.append(GateOutputEvent(t.cv_index, False))
+        return events
 
-    def update(self, now_us):
-        """主循环每轮调用：若已达/超过门控关闭时刻，则统一拉低所有门。"""
-        if self.next_gate_off_us is not None and ticks_diff(now_us, self.next_gate_off_us) >= 0:
-            self._gate_off()
-            self.next_gate_off_us = None
-
-    def _gate_off(self, _=None):
-        self.hw.off_all_cvs()
+    def pump(self, now_us):
+        """取出已达/超过应发时刻的调度输出事件（如门控关闭）。"""
+        due = []
+        remain = []
+        for due_us, ev in self._scheduled:
+            if ticks_diff(now_us, due_us) >= 0:
+                due.append(ev)
+            else:
+                remain.append((due_us, ev))
+        self._scheduled = remain
+        return due
 
 
 # ---------------------------------------------------------------------------
@@ -747,6 +897,10 @@ class Transport:
         self.beat_index = 0  # 全局已发生节拍数（第 k 拍后 = k），供显示唱头分页对齐
         self.next_clock_us = 0  # 下一次内部时钟事件应发生的 tick（us）
 
+    def set_on_tick(self, cb):
+        """（重构）允许 Application 在构造后注入节拍回调，解耦 Transport 与 Controller。"""
+        self._on_tick = cb
+
     def beat_us(self):
         # 实际每拍间隔 = 60s / (BPM x mul)
         eff = self.bpm * self.mul
@@ -764,7 +918,7 @@ class Transport:
     def update(self, now_us):
         """主循环每轮调用：若已达/超过下一次时钟事件，则触发一次节拍并重新锚定调度。
         无论错过多少 tick 都只补一次（重新锚定到 now_us 之后），避免阻塞后爆发式追拍。"""
-        if self.source != "INT" or not self.running:
+        if self.source != "INT" or not self.running or self._on_tick is None:
             return
         if ticks_diff(now_us, self.next_clock_us) >= 0:
             self._on_tick()
@@ -780,7 +934,7 @@ class Transport:
 
     def ext_tick(self, t=None):
         # 仅在外部时钟源时由 din 上升沿驱动（INT 时忽略）
-        if self.source == "EXT":
+        if self.source == "EXT" and self._on_tick is not None:
             self._on_tick()
             self.beat_index += 1  # 已发生一拍（与 pos/last_out 同相）
 
@@ -861,47 +1015,43 @@ class AppState:
 
 
 # ---------------------------------------------------------------------------
-# Renderer —— 无状态渲染（读 AppState + Sequencer/Transport，经 Hardware 绘制）
+# ViewModel —— 渲染用视图模型（重构计划步骤 6）：把模型读数翻译为渲染就绪视图
+# Renderer 只读取本模型，不直接访问 Transport/Track 内部结构。
 # ---------------------------------------------------------------------------
 
-class Renderer:
-    """Renderer：无状态。每次 render() 重新读取模型计算 OLED 内容，
-    不修改任何状态，不持有持久 UI 数据。"""
+class SequencerViewModel:
+    """无状态视图模型：消费 AppState + Sequencer + Transport，呈现渲染所需视图。
+    渲染复杂时（如唱头分页/参数取值）在此集中计算，保持 Renderer 纯粹为「画」。"""
 
-    def render(self, app, seq, transport, hw):
-        hw.display_clear()
-        if app.page == 0:
-            self._draw_global(app, transport, hw)
-        else:
-            self._draw_channel(app, seq.tracks[app.page - 1], transport, hw)
-        hw.display_show()
+    def __init__(self, app, seq, transport):
+        self.app = app
+        self.seq = seq
+        self.transport = transport
 
-    def _draw_global(self, app, transport, hw):
-        # 全局时钟页只显示顶栏：页标记右上角，参数左上角；其余行留空。
-        # P0 无对应 track，左下角不绘制触发指示。显示完全由 GLOBAL_PARAMS 表驱动。
-        abbr, _, _, _, _, _, fmt = GLOBAL_PARAMS[app.sel]
-        page_str = f"P{app.page}"
-        hw.display_text(page_str, OLED_WIDTH - len(page_str) * 8, 0)  # 右上角页标记
-        hw.display_text(f"{abbr}:{fmt(transport)}", 0, 0)            # 左上角参数（左对齐）
+    @property
+    def page(self):
+        return self.app.page
 
-    def _draw_channel(self, app, track, transport, hw):
-        abbr, kind = CH_PARAMS[app.sel]
+    def status(self):
+        """返回 (页标记串, 顶栏参数串)。"""
+        if self.app.page == 0:
+            abbr, _, _, _, _, _, fmt = GLOBAL_PARAMS[self.app.sel]
+            return f"P{self.app.page}", f"{abbr}:{fmt(self.transport)}"
+        abbr, kind = CH_PARAMS[self.app.sel]
+        track = self.seq.tracks[self.app.page - 1]
         if kind == "merge":
             val = MERGE_MODES[track.merge]
         else:
             val = self._param_value(track, kind)
-        page_str = f"P{app.page}"
-        hw.display_text(page_str, OLED_WIDTH - len(page_str) * 8, 0)  # 右上角页标记
-        hw.display_text(f"{abbr}:{val}", 0, 0)                        # 左上角参数（左对齐）
-        # 全局 16 步窗口：按 beat_index 以 16 步分页（满 16 步翻到下一页）。
-        # 序列长度 ≠ 16 时循环补足 16 列；两序列共用同一窗口偏移，唱头对齐二者。
-        bi = transport.beat_index
+        return f"P{self.app.page}", f"{abbr}:{val}"
+
+    def channel_sequence(self):
+        """返回 (track, wstart, cur) 供序列行与唱头绘制。"""
+        track = self.seq.tracks[self.app.page - 1]
+        bi = self.transport.beat_index
         cur = bi - 1 if bi > 0 else 0          # 当前全局步（0 基）
         wstart = (cur // 16) * 16              # 当前 16 步页起点
-        self._draw_seq_row(track.g1, 8, wstart, hw)
-        self._draw_seq_row(track.g2, 16, wstart, hw)
-        # 底部唱头：随节拍向右，仅唱头所在列显示方块(触发)/点(未触发)
-        self._draw_playhead(track, cur % 16, 26, hw)
+        return track, wstart, cur
 
     def _param_value(self, track, kind):
         mapping = {
@@ -915,6 +1065,43 @@ class Renderer:
             "prob2": track.g2.prob,
         }
         return mapping.get(kind, "")
+
+
+# ---------------------------------------------------------------------------
+# Renderer —— 无状态渲染（读 ViewModel，经 Hardware 绘制）
+# ---------------------------------------------------------------------------
+
+class Renderer:
+    """Renderer：无状态。每次 render() 经 ViewModel 重新读取模型计算 OLED 内容，
+    不修改任何状态，不持有持久 UI 数据。"""
+
+    def render(self, app, seq, transport, hw):
+        hw.display_clear()
+        vm = SequencerViewModel(app, seq, transport)
+        if app.page == 0:
+            self._draw_global(vm, hw)
+        else:
+            self._draw_channel(vm, hw)
+        hw.display_show()
+
+    def _draw_global(self, vm, hw):
+        # 全局时钟页只显示顶栏：页标记右上角，参数左上角；其余行留空。
+        # P0 无对应 track，左下角不绘制触发指示。显示完全由 GLOBAL_PARAMS 表驱动。
+        page_str, val_str = vm.status()
+        hw.display_text(page_str, OLED_WIDTH - len(page_str) * 8, 0)  # 右上角页标记
+        hw.display_text(val_str, 0, 0)                                # 左上角参数（左对齐）
+
+    def _draw_channel(self, vm, hw):
+        page_str, val_str = vm.status()
+        hw.display_text(page_str, OLED_WIDTH - len(page_str) * 8, 0)  # 右上角页标记
+        hw.display_text(val_str, 0, 0)                               # 左上角参数（左对齐）
+        track, wstart, cur = vm.channel_sequence()
+        # 全局 16 步窗口：按 beat_index 以 16 步分页（满 16 步翻到下一页）。
+        # 序列长度 ≠ 16 时循环补足 16 列；两序列共用同一窗口偏移，唱头对齐二者。
+        self._draw_seq_row(track.g1, 8, wstart, hw)
+        self._draw_seq_row(track.g2, 16, wstart, hw)
+        # 底部唱头：随节拍向右，仅唱头所在列显示方块(触发)/点(未触发)
+        self._draw_playhead(track, cur % 16, 26, hw)
 
     def _draw_seq_row(self, gen, y, wstart, hw):
         # 16 列窗口（8px/列，整屏宽度）：列 c 对应全局步 (wstart + c)。
@@ -933,82 +1120,39 @@ class Renderer:
         else:
             hw.display_fill_rect(play_pos * 8 + 2, y + 2, 2, 2, 1)
 
+
 # ---------------------------------------------------------------------------
-# Controller / Application —— 事件分发 + 命令派发 + 触发渲染（几乎无业务逻辑）
+# UI Pages —— 把交互译为命令（重构计划步骤 5：与 Controller 分离）
+# 仅产出 Command，不直接改模型；经注入的 exec_cmd 回调统一执行。
 # ---------------------------------------------------------------------------
 
-class Euclidean2(EuroPiScript):
-    @classmethod
-    def display_name(cls):
-        return "Euclid2 6ch"
+class Pages:
+    """UI Pages：把旋钮/按键交互翻译为命令（Command），不直改模型。
+    通过构造时注入的 exec_cmd(Command) 回调提交变更；选中项变化经 app.dirty 触发重绘。
+    """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, app, transport, seq, exec_cmd):
+        self.app = app
+        self.transport = transport
+        self.seq = seq
+        self._exec = exec_cmd
 
-        self.hw = Hardware()
-        self.app = AppState()
-        self.transport = Transport(self._on_beat)
-        self.seq = Sequencer(self.hw)
+    def set_exec(self, exec_cmd):
+        self._exec = exec_cmd
 
-        # 6 通道默认节奏（差异化）
-        for i in range(6):
-            g1 = EuclidPattern(16, 5, 0, 100)
-            g2 = EuclidPattern(16, 3, (i * 2) % 16, 100)
-            self.seq.add_track(Track(i, g1, g2, MERGE_OR))
-
-        self.input = InputManager(self.hw)
-        self.renderer = Renderer()
-
-        # 时钟输入由 Hardware 自管理：on_clock_rise 已在 Hardware.__init__ 注册，
-        # 外部时钟上升沿经队列作为 ClockEvent 流出，dispatch 中驱动 Transport.ext_tick
-        if SAVE_STATES:
-            self.load_state()
-        # 启动时钟（依据当前 source：默认 INT）
-        if self.transport.source == "INT":
-            self.transport.start()
-        else:
-            self.transport.stop()
-
-    # —— 节拍（ClockTick 事件）——
-    def _on_beat(self):
-        with PROFILER.section("on_beat"):
-            self.seq.tick(self.transport.level)
-        self.app.dirty = True
-
-    # —— 事件分发（Controller 的职责之一）——
-    def dispatch(self, ev):
-        if isinstance(ev, KnobTurn):
-            if ev.knob == 1:
-                self._on_knob1(ev.value)
-            else:
-                self._on_knob2(ev.value)
-        elif isinstance(ev, ButtonEvent):
-            if ev.button == "B1":
-                if ev.kind == "long":
-                    self.save_state()  # 长按 K1：显式保存（唯一触发 save 的途径）
-                else:
-                    self.app.prev_page()
-            else:  # B2
-                if ev.kind == "long":
-                    self.app.goto_global()
-                else:
-                    self.app.next_page()
-        elif isinstance(ev, ClockEvent):
-            # 外部时钟 tick：仅 EXT 源生效（Transport.ext_tick 内含 source 守卫）
-            self.transport.ext_tick()
-
-    # —— UI Pages：把交互译为命令（只调用 Transport / Track 的设置器）——
-    def _on_knob1(self, p):
+    # —— K1：参数选择（带 ±0.5 档迟滞，防边界抖动）——
+    def on_knob1(self, p):
         n = len(GLOBAL_PARAMS) if self.app.page == 0 else len(CH_PARAMS)
-        idx = int(p * n)  # 截断实现 ±0.5 档迟滞，防边界抖动
+        idx = int(p * n)  # 截断实现 ±0.5 档迟滞
         if idx >= n:
             idx = n - 1
         if idx != self.app.sel:
             self.app.sel = idx
             self.app.k2_picked = False
-            self.on_changed()  # 选中项变了，立即请求重绘（修复停钟时不刷新的问题）
+            self._changed()  # 选中项变了，立即请求重绘（修复停钟时不刷新的问题）
 
-    def _on_knob2(self, p):
+    # —— K2：参数数值调节（拾取策略）——
+    def on_knob2(self, p):
         if self.app.page == 0:
             self._edit_global(p)
         else:
@@ -1056,7 +1200,7 @@ class Euclidean2(EuroPiScript):
 
     def _apply_pickup(self, current, pmin, pmax, make_cmd, p, discrete=False):
         """K2 拾取策略：旋钮位置匹配当前值（tol 容差）后才生效；生效后值变化即提交。
-        提交经 _exec(command) 统一执行（改模型 + 置 dirty）。"""
+        提交经注入的 exec_cmd(command) 统一执行（改模型 + 置 dirty）。"""
         val = round(p * (pmax - pmin)) + pmin
         val = min(max(val, pmin), pmax)
         tol = 0 if discrete else max(1, (pmax - pmin) // 32)
@@ -1068,6 +1212,69 @@ class Euclidean2(EuroPiScript):
             return
         self._exec(make_cmd(val))
 
+    def _changed(self):
+        self.app.dirty = True
+
+
+# ---------------------------------------------------------------------------
+# Controller —— 事件分发 + 命令派发 + 主循环（重构计划步骤 5：与 Application/Pages 分离）
+# 持有模型与硬件适配器；把输入事件经 Pages 译为命令执行，把 Sequencer 输出事件经
+# Hardware 适配器落盘。几乎无业务逻辑（业务在模型/页面内）。
+# ---------------------------------------------------------------------------
+
+class Controller:
+    def __init__(self, hw, app, transport, seq, input_mgr, renderer, pages, on_save=None):
+        self.hw = hw
+        self.app = app
+        self.transport = transport
+        self.seq = seq
+        self.input = input_mgr
+        self.renderer = renderer
+        self.pages = pages
+        self._on_save = on_save
+
+    # —— 节拍（ClockTick 事件）：产出输出事件并 apply ——
+    def _on_beat(self):
+        with PROFILER.section("on_beat"):
+            # 同步门触发高电平（全局输出电压）后再应用本轮输出事件
+            self.hw.set_gate_level(self.transport.level)
+            events = self.seq.tick(ticks_us())
+            self._apply_outputs(events)
+        self.app.dirty = True
+
+    # —— 把输出事件 apply 到硬件（Hardware 是唯一出口）——
+    def _apply_outputs(self, events):
+        for ev in events:
+            if isinstance(ev, GateOutputEvent):
+                self.hw.set_gate(ev.channel, ev.state)
+            elif isinstance(ev, CVOutputEvent):
+                self.hw.set_cv(ev.channel, ev.voltage)
+            elif isinstance(ev, ClockOutputEvent):
+                pass  # 当前脚本无独立时钟输出引脚
+
+    # —— 事件分发（Controller 的职责之一）——
+    def dispatch(self, ev):
+        if isinstance(ev, KnobTurn):
+            if ev.knob == 1:
+                self.pages.on_knob1(ev.value)
+            else:
+                self.pages.on_knob2(ev.value)
+        elif isinstance(ev, ButtonEvent):
+            if ev.button == "B1":
+                if ev.kind == "long":
+                    if self._on_save:
+                        self._on_save()  # 长按 K1：显式保存（唯一触发 save 的途径）
+                else:
+                    self.app.prev_page()
+            else:  # B2
+                if ev.kind == "long":
+                    self.app.goto_global()
+                else:
+                    self.app.next_page()
+        elif isinstance(ev, ClockEvent):
+            # 外部时钟 tick：仅 EXT 源生效（Transport.ext_tick 内含 source 守卫）
+            self.transport.ext_tick()
+
     # —— 命令执行（Controller → Model 统一出口，与输入侧事件对称）——
     def _exec(self, cmd):
         """执行一个命令：改模型 + 置 dirty。所有模型变更都经此单一出口，
@@ -1075,7 +1282,95 @@ class Euclidean2(EuroPiScript):
         cmd.execute()
         self.on_changed()
 
-    # —— 状态持久化（受 SAVE_STATES 开关控制）——
+    def on_changed(self):
+        self.app.dirty = True
+
+    # —— 主循环（microsecond tick 驱动）——
+    def main(self):
+        while True:
+            now_us = ticks_us()
+            with PROFILER.section("loop"):
+                # 内部时钟 / 门控关闭：到达应发生的 tick 时由主循环触发
+                self.transport.update(now_us)
+                # 取走已达时刻的调度输出事件（门控关闭等）并 apply
+                due = self.seq.pump(now_us)
+                if due:
+                    self._apply_outputs(due)
+                with PROFILER.section("poll"):
+                    events = self.input.poll()
+                for ev in events:
+                    with PROFILER.section("dispatch"):
+                        self.dispatch(ev)
+                # 屏幕刷新：预留 t_show，距离下次时钟事件 < t_show 时跳过，避免抢占时钟精度
+                if self.app.dirty:
+                    gap = self.transport.time_to_next_clock_us(now_us)
+                    if gap is None or gap >= T_SHOW_US:
+                        with PROFILER.section("render"):
+                            self.renderer.render(self.app, self.seq, self.transport, self.hw)
+                        self.app.dirty = False
+            time.sleep_ms(0)
+            PROFILER.maybe_print(now_us)
+
+
+# ---------------------------------------------------------------------------
+# Application —— EuroPiScript 入口（重构计划步骤 5：与 Controller/Pages 分离）
+# 负责装配 Hardware / 模型 / Controller，以及状态持久化（依赖 EuroPiScript 的
+# save_state_json / load_state_json）。
+# ---------------------------------------------------------------------------
+
+class Euclidean2(EuroPiScript):
+    @classmethod
+    def display_name(cls):
+        return "Euclid2 6ch"
+
+    def __init__(self):
+        super().__init__()
+
+        # 装配硬件与模型（Platform 无关层在此接线）
+        hw = Hardware()
+        app = AppState()
+        transport = Transport(None)
+        seq = Sequencer()
+
+        # 6 通道默认节奏（差异化）
+        for i in range(6):
+            g1 = EuclidPattern(16, 5, 0, 100)
+            g2 = EuclidPattern(16, 3, (i * 2) % 16, 100)
+            seq.add_track(Track(i, g1, g2, MERGE_OR))
+
+        input_mgr = InputManager(hw)
+        renderer = Renderer()
+        pages = Pages(app, transport, seq, None)  # exec 回调在 Controller 建好后注入
+
+        controller = Controller(
+            hw, app, transport, seq, input_mgr, renderer, pages,
+            on_save=self.save_state,
+        )
+        pages.set_exec(controller._exec)      # 注入命令执行出口
+        transport.set_on_tick(controller._on_beat)  # 注入节拍回调
+        hw.set_gate_level(transport.level)
+
+        # 暴露给持久化方法
+        self.hw = hw
+        self.app = app
+        self.transport = transport
+        self.seq = seq
+        self.controller = controller
+
+        # 时钟输入由 Hardware 自管理：on_clock_rise 已在 Hardware.__init__ 注册，
+        # 外部时钟上升沿经队列作为 ClockEvent 流出，dispatch 中驱动 Transport.ext_tick
+        if SAVE_STATES:
+            self.load_state()
+        # 启动时钟（依据当前 source：默认 INT）
+        if self.transport.source == "INT":
+            self.transport.start()
+        else:
+            self.transport.stop()
+
+    def main(self):
+        self.controller.main()
+
+    # —— 状态持久化（受 SAVE_STATES 开关控制；依赖 EuroPiScript 的 JSON 接口）——
     def on_changed(self):
         self.app.dirty = True
 
@@ -1102,29 +1397,6 @@ class Euclidean2(EuroPiScript):
         if not SAVE_STATES:
             return
         self.save_state_json(self.get_state())
-
-    # —— 主循环（microsecond tick 驱动）——
-    def main(self):
-        while True:
-            now_us = ticks_us()
-            with PROFILER.section("loop"):
-                # 内部时钟 / 门控关闭：到达应发生的 tick 时由主循环触发
-                self.transport.update(now_us)
-                self.seq.update(now_us)
-                with PROFILER.section("poll"):
-                    events = self.input.poll()
-                for ev in events:
-                    with PROFILER.section("dispatch"):
-                        self.dispatch(ev)
-                # 屏幕刷新：预留 t_show，距离下次时钟事件 < t_show 时跳过，避免抢占时钟精度
-                if self.app.dirty:
-                    gap = self.transport.time_to_next_clock_us(now_us)
-                    if gap is None or gap >= T_SHOW_US:
-                        with PROFILER.section("render"):
-                            self.renderer.render(self.app, self.seq, self.transport, self.hw)
-                        self.app.dirty = False
-            time.sleep_ms(0)
-            PROFILER.maybe_print(now_us)
 
 
 if __name__ == "__main__":
