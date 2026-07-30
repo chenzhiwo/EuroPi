@@ -24,7 +24,7 @@ Seq2 - 6-track multi-engine sequencer
   track1 → CV1(主/音高) + CV4(门/钟)
   track2 → CV2(主/音高) + CV5(门/钟)
   track3 → CV3(主/音高) + CV6(门/钟)
-  - EUC 时：门/钟通道输出触发（时钟），主通道保持 0V
+  - EUC 时：第一个 CV（cv1~3）出门（欧几里得节奏），第二个 CV（cv4~6）出时钟（每个步稳定脉冲）
   - CV  时：主通道出保持型音高，门通道出门脉冲（长度 GLEN）；步值=0 时不出门
 
 电压范围下沉到每轨（v_lo / v_hi）；门高电平由引擎翻译成两次电压事件。
@@ -763,13 +763,15 @@ class EuclidEngine(TrackEngine):
         self.last_out = on
         v_hi = settings.v_hi
         v_lo = settings.v_lo
-        # EUC 仅出节奏：门/钟通道（cv4~6）输出触发，配对主通道（cv1~3）保持 0V
+        # EUC 固定配对双通道：第一个 CV（cv1~3）出门（欧几里得节奏），
+        # 第二个 CV（cv4~6）出时钟（每个步稳定脉冲）
         if on:
-            bus.emit(CVOutputEvent(ch_gate, v_hi))
-            bus.emit_after(GATE_MS * 1000, CVOutputEvent(ch_gate, v_lo))
+            bus.emit(CVOutputEvent(ch_pitch, v_hi))
+            bus.emit_after(GATE_MS * 1000, CVOutputEvent(ch_pitch, v_lo))
         else:
-            bus.emit(CVOutputEvent(ch_gate, v_lo))
-        bus.emit(CVOutputEvent(ch_pitch, 0))
+            bus.emit(CVOutputEvent(ch_pitch, v_lo))
+        bus.emit(CVOutputEvent(ch_gate, v_hi))
+        bus.emit_after(GATE_MS * 1000, CVOutputEvent(ch_gate, v_lo))
 
     def reset(self):
         self.player.reset()

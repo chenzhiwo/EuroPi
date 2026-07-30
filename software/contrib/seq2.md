@@ -17,7 +17,7 @@
 2. 轨道类型（首版三种，架构上可扩展）：
    - **OFF**：该轨关闭，两端输出 0V。
    - **EUC**：欧几里得节奏引擎（沿用 euclidean2 的双发生器 + 合并逻辑）；
-     **门/钟通道（cv4~6）输出触发（时钟）**，主通道（cv1~3）保持 0V。
+     第一个 CV（cv1~3）出门（欧几里得节奏），第二个 CV（cv4~6）出时钟（每个步稳定脉冲）。
   - **CV**：最长 16 步的 CV 步进音序器，输出保持型电压；
     **主通道出音高，门通道（cv4~6）出门脉冲**（长度 `GLEN`）；
     **步值 = 0 时该步不出门**（主通道仍出 `v_lo`）。
@@ -131,8 +131,10 @@ class TrackEngine:
   | LVL | **本轨触发电压**（= `settings.v_hi`） | 0 ~ 10 V |
 
 - 步槽数量：0（K1 全程用于选参数，行为与 euclidean2 相同）。
-- 输出：本拍触发 → `emit(CV(ch, v_hi))`，并 `emit_after(GATE_MS, CV(ch, v_lo))`；
-  不触发 → `emit(CV(ch, v_lo))`。
+- 输出（固定配对双通道）：第一个 CV 出「门」——本拍触发 → `emit(CV(cv_index, v_hi))` 并
+  `emit_after(GATE_MS, CV(cv_index, v_lo))`，不触发 → `emit(CV(cv_index, v_lo))`；
+  第二个 CV 出「时钟」——每个步稳定 `emit(CV(gate_index, v_hi))` 并
+  `emit_after(GATE_MS, CV(gate_index, v_lo))`。
 
 #### CVSeqEngine（CV 使用）
 - 组成：`StepPattern`（`values[16]`，每步 **0~127**，与 MIDI note 可能性一致）+ `TrackPlayer`（`pos`）。
@@ -194,7 +196,7 @@ class Track:
 - **两种引擎实例常驻**：切换类型后再切回，参数与音型**原样保留**（用户可 A/B 对比）。
   代价是 RAM（每轨多一个引擎），估算见 §9。
 - **固定配对**：`cv_index = idx`，`gate_index = idx + 3`，不随类型变化（jack 归属稳定）。
-  EUC 时门通道出触发、主通道保持 0V；CV 时主通道出音高、门通道出门脉冲。
+  EUC 时第一个 CV 出门（节奏）、第二个 CV 出时钟；CV 时主通道出音高、门通道出门脉冲。
 - 切换类型时：`new_engine.reset()`（播放头归零，与其他轨对齐）、`AppState.sel = 0`、
   `k2_picked = False`、`dirty = True`；**通道配对不变**。
 
@@ -216,7 +218,7 @@ EuroPi 仅有 **6 个 CV 输出**（0~10V，可兼作门），无独立 gate 引
 - `Track.cv_index = idx`，`Track.gate_index = idx + 3`（构造时确定，不随类型变化）。
 - 通道分配实现为常量，无 `ROUTE` 表、无溢出、无冲突（结构上不可能两轨争用同一输出）。
 - **类型决定门通道语义**：
-  - EUC：门通道（cv4~6）输出触发（时钟），主通道（cv1~3）保持 0V。
+  - EUC：第一个 CV（cv1~3）出门（欧几里得节奏），第二个 CV（cv4~6）出时钟（每个步稳定脉冲）。
   - CV：主通道出保持型音高，门通道出门脉冲（`GLEN` 控制长度）；**步值 = 0 时不出门**。
   - OFF：两端均 0V。
 - UI 顶栏标注每轨配对 jack（如 `cv1+cv4`）便于接线核对。
