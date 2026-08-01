@@ -43,7 +43,7 @@ CPU_FREQS = {
     },
     MODEL_PICO_2: {
         DEFAULT_FREQ: 150_000_000,      # Pico 2 default frequency is 150MHz
-        OVERCLOCKED_FREQ: 300_000_000,  # Overclocked frequency is 300MHz
+        OVERCLOCKED_FREQ: 200_000_000,  # Conservative overclock; 300MHz has limited margin at stock voltage
         UNDERCLOCKED_FREQ: 75_000_000,  # Underclock to 75MHz
     },
     MODEL_PICO_2W: {
