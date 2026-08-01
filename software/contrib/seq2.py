@@ -192,6 +192,8 @@ NUM_PAGES = 4        # 0 全局 + 1..3 轨道
 T_SHOW_US = 20_000
 DEBOUNCE_MS = 30
 KNOB_DEADBAND = 0.01
+SAVE_NOTICE_MS = 1_000
+SAVE_NOTICE_TEXT = "SAVED"
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +334,13 @@ class SetTransportSource(Command):
         self._t, self._v = transport, src
     def execute(self):
         self._t.set_source(self._v)
+
+
+class ToggleInternalClock(Command):
+    def __init__(self, transport):
+        self._t = transport
+    def execute(self):
+        self._t.toggle_internal_clock()
 
 
 class SetBpm(Command):
@@ -1028,6 +1037,14 @@ class Transport:
     def stop(self):
         self.running = False
 
+    def toggle_internal_clock(self):
+        if self.source != "INT":
+            return
+        if self.running:
+            self.stop()
+        else:
+            self.start()
+
     def update(self, now_us):
         if self.source != "INT" or not self.running or self._on_tick is None:
             return
@@ -1060,7 +1077,7 @@ class Transport:
         if bpm == self.bpm:
             return
         self.bpm = bpm
-        if self.source == "INT":
+        if self.source == "INT" and self.running:
             self.start()
 
     def set_mul(self, mul):
@@ -1068,7 +1085,7 @@ class Transport:
         if mul == self.mul:
             return
         self.mul = mul
-        if self.source == "INT":
+        if self.source == "INT" and self.running:
             self.start()
 
     def to_dict(self):
@@ -1092,6 +1109,18 @@ class AppState:
         self.sel = 0
         self.k2_picked = False
         self.dirty = True
+        self.notice = None
+        self.notice_until_ms = 0
+
+    def show_notice(self, text, duration_ms):
+        self.notice = text
+        self.notice_until_ms = ticks_add(ticks_ms(), duration_ms)
+        self.dirty = True
+
+    def expire_notice(self, now_ms):
+        if self.notice is not None and ticks_diff(now_ms, self.notice_until_ms) >= 0:
+            self.notice = None
+            self.dirty = True
 
     def _set_page(self, p):
         self.page = p
@@ -1120,7 +1149,13 @@ class Renderer:
             self._draw_global(app, seq, transport, hw)
         else:
             self._draw_channel(app, seq, transport, hw)
+        if app.notice is not None:
+            self._draw_notice(app.notice, hw)
         hw.display_show()
+
+    def _draw_notice(self, text, hw):
+        hw.display_fill_rect(0, 0, OLED_WIDTH, CHAR_HEIGHT, 0)
+        hw.display_text(text, 0, 0)
 
     def _status(self, app, seq, transport):
         if app.page == 0:
@@ -1295,13 +1330,15 @@ class Controller:
         elif isinstance(ev, ButtonEvent):
             if ev.button == "B1":
                 if ev.kind == "long":
-                    if self._on_save:
-                        self._on_save()
+                    self._exec(ToggleInternalClock(self.transport))
                 else:
                     self.app.prev_page()
             else:
                 if ev.kind == "long":
-                    self.app.goto_global()
+                    if self._on_save:
+                        saved = self._on_save()
+                        if saved is not False:
+                            self.app.show_notice(SAVE_NOTICE_TEXT, SAVE_NOTICE_MS)
                 else:
                     self.app.next_page()
         elif isinstance(ev, ClockEvent):
@@ -1318,6 +1355,7 @@ class Controller:
         while True:
             now_us = ticks_us()
             with PROFILER.section("loop"):
+                self.app.expire_notice(ticks_ms())
                 self.transport.update(now_us)
                 due = self.seq.pump(now_us)
                 if due:
@@ -1410,8 +1448,9 @@ class Seq2(EuroPiScript):
 
     def save_state(self):
         if not SAVE_STATES:
-            return
+            return False
         self.save_state_json(self.get_state())
+        return True
 
 
 if __name__ == "__main__":

@@ -39,8 +39,8 @@
 | cv1..cv6 | 3 对固定配对输出（cv1/4, cv2/5, cv3/6）；cv1~3 出主信号/音高，cv4~6 出门/钟 |
 | K1 | **槽位选择**（参数槽 + 步槽，见 §5.2） |
 | K2 | **数值编辑**（拾取策略；编辑步槽时改用 jump 策略） |
-| B1 | 短按上一页；长按 (>500ms) 保存状态 |
-| B2 | 短按下一页；长按 (>500ms) 回 P0 |
+| B1 | 短按上一页；长按 (>500ms) 切换内部时钟启动/停止（仅 `CLK=INT`） |
+| B2 | 短按下一页；长按 (>500ms) 保存状态，成功后在顶部一行左对齐显示 `SAVED` 1 秒 |
 | B1+B2 | 返回菜单（系统行为，脚本不拦截） |
 | DIN | 外部时钟（沿用 Hardware 的 ISR + 事件队列） |
 | OLED | 128×32，1bpp；16 列 × 8px 恰好铺满屏宽 |
@@ -48,7 +48,7 @@
 **性能约束（继承自 euclidean2，不得回退）**
 - 时钟精度优先：屏幕刷新前检查 `time_to_next_clock_us() >= T_SHOW_US(20ms)`，否则跳过。
 - `tick()` 热路径避免堆分配与 `isinstance` 链过长；输出事件对象**按轨复用单例**（见 §4.3）。
-- flash 写入只在长按 B1 时发生，绝不在主循环自动落盘。
+- flash 写入只在长按 B2 时发生，绝不在主循环自动落盘。
 
 ---
 
@@ -326,7 +326,7 @@ P0：     仅行0
 硬件 → Hardware → InputManager → Controller.dispatch
    ├ KnobTurn(K1) → Pages.on_knob1 → 槽位选择（读 engine.PARAMS / step_slots）
    ├ KnobTurn(K2) → Pages.on_knob2 → 拾取 → Command → _exec → 改模型 + dirty
-   ├ ButtonEvent  → 翻页 / 回P0 / 保存
+   ├ ButtonEvent  → 翻页 / 内部时钟启停 / 保存
    └ ClockEvent   → Transport.ext_tick（仅 EXT）
 ```
 
@@ -349,7 +349,8 @@ dirty 且 距下次时钟 >= T_SHOW_US → Renderer.render → ViewModel → eng
 ## 8. 状态持久化
 
 - 存档文件：`saved_state_Seq2.txt`（由 EuroPiScript 按类名生成，与 euclidean2 互不干扰）。
-- 触发：**仅长按 B1**。
+- 触发：**仅长按 B2**；保存成功后在屏幕左上角显示 `SAVED` 1 秒，仅覆盖状态栏，时钟、
+  音序输出与其余画面不会暂停。
 - Schema：
 
 ```json
@@ -416,7 +417,8 @@ dirty 且 距下次时钟 >= T_SHOW_US → Renderer.render → ViewModel → eng
 - [ ] CV 轨：K1 前段选参数、后段选步；K2 可编辑步电压，输出电压落在 `[VLO,VHI]` 内并保持到下一拍。
 - [ ] 修改 `VLO/VHI` 时已编辑音型形态不变（只整体缩放）。
 - [ ] 全局页无 `LVL`；每轨电压互不影响。
-- [ ] 长按 B1 保存 → 重启后（含类型、两套引擎配置、电压范围）完整恢复。
+- [ ] 长按 B1 可切换内部时钟启动/停止；`CLK=EXT` 时不影响外部时钟。
+- [ ] 长按 B2 保存 → 重启后（含类型、两套引擎配置、电压范围）完整恢复。
 - [ ] INT 480BPM（120×4）下时钟抖动与 euclidean2 同级；`PROFILE=True` 时 `on_beat` 均值不高于基线。
 
 ---
