@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Seq2 - 6-track multi-engine sequencer
+Seq2 - 3-track multi-engine sequencer
 =====================================
 
 3 条轨道，每条占用一对固定的 CV 输出（共 6 路），可在三种类型间切换：
@@ -1344,7 +1344,7 @@ class Controller:
 class Seq2(EuroPiScript):
     @classmethod
     def display_name(cls):
-        return "Seq2 6trk"
+        return "Seq2"
 
     def __init__(self):
         super().__init__()

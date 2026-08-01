@@ -1,4 +1,4 @@
-# Seq2 — 6 轨多功能音序器（架构需求文档）
+# Seq2 — 3 轨多功能音序器（架构需求文档）
 
 > 本文件是 **架构 / 需求说明**，是 `software/contrib/seq2.py` 的实现依据。
 > seq2 在 `euclidean2.py` 的分层架构基础上重构而来，保留其事件流、命令、渲染分层与
@@ -391,7 +391,7 @@ dirty 且 距下次时钟 >= T_SHOW_US → Renderer.render → ViewModel → eng
 
 ## 10. 实现步骤（建议顺序）
 
-1. 复制 `euclidean2.py` → `seq2.py`，重命名类 `Seq2(EuroPiScript)`，`display_name() = "Seq2 6trk"`。
+1. 复制 `euclidean2.py` → `seq2.py`，重命名类 `Seq2(EuroPiScript)`，`display_name() = "Seq2"`。
 2. **输出层改造**：删 `GateOutputEvent` / `set_gate_level`，引入 `OutputBus` +
    `CVOutputEvent` 单例复用；`Sequencer` 持有延时队列。
 3. **电压下沉**：`TrackSettings` 加 `v_lo/v_hi`；删 `Transport.level` / `SetLevel` /
