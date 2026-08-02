@@ -31,8 +31,11 @@ SET_CHARGE_PUMP = 0x8D
 
 
 class SSD1306_I2C:
-    def __init__(self, *args):
-        pass
+    def __init__(self, width, height, *args):
+        self.width = width
+        self.height = height
+        self.pages = height // 8
+        self.buffer = bytearray(width * self.pages)
 
     def contrast(self, *args):
         pass
@@ -62,4 +65,7 @@ class SSD1306_I2C:
         pass
 
     def write_cmd(self, *args):
+        pass
+
+    def write_data(self, *args):
         pass

@@ -27,11 +27,12 @@ Seq2 - 3-track multi-engine sequencer
   - EUC 时：第一个 CV（cv1~3）出门（欧几里得节奏），第二个 CV（cv4~6）出时钟（每个步稳定脉冲）
   - CV  时：主通道出保持型音高，门通道出门脉冲（长度 GLEN）；步值=0 时不出门
 
-电压范围下沉到每轨（v_lo / v_hi）；门高电平由引擎翻译成两次电压事件。
+电压范围下沉到每轨（v_lo / v_hi）；门由固定容量 OutputScheduler 维护电平与截止时间。
 
 控制 / 时钟 / 页面交互见 seq2.md。本文件保持单文件，严格按分层架构：
-  Hardware → InputManager → Controller → (Pages / AppState / Sequencer /
-  TrackEngine / Transport) → Renderer。仅 Hardware 接触 EuroPi API。
+  Hardware / ClockCapture → InputManager → Controller → Pages / UiState /
+  ClockService / TransportRuntime / Sequencer / TrackFeature / OutputScheduler；
+  ViewSnapshot → Renderer。仅 Hardware 接触 EuroPi API。
 """
 
 try:
@@ -62,11 +63,6 @@ except ImportError:
     from europi import *
     from europi_script import EuroPiScript
 
-try:
-    from experimental.euclid import generate_euclidean_pattern
-except ImportError:
-    from firmware.experimental.euclid import generate_euclidean_pattern
-
 import random
 import time
 import micropython
@@ -85,7 +81,8 @@ class _NullProfiler:
     class _NullSection:
         def __enter__(self): return self
         def __exit__(self, *a): return False
-    def section(self, name): return self._NullSection()
+    _section = _NullSection()
+    def section(self, name): return self._section
     def record(self, name, dt_us): pass
     def maybe_print(self, now_us): pass
     def print_stats(self): pass
@@ -186,14 +183,141 @@ CV_MAX = 10          # CV 输出上限（0~10V）
 CV_MIN = 0
 CV_LEN = 16          # CV 序列最大步数
 CV_VAL_MAX = 127     # 步值分辨率 = MIDI note 0~127
+CV_GATE_MIN = 10     # 保留足够的最短脉宽，避开 OLED/GC 抖动窗口
+CV_GATE_MAX = 90     # 每步保留明确 LOW 间隙，不使用 100% legato
 
 NUM_TRACKS = 3       # 3 条轨道，每条占用一对 CV（主 + 门/钟）
 NUM_PAGES = 4        # 0 全局 + 1..3 轨道
-T_SHOW_US = 20_000
+PAGE_LABELS = ("P0", "P1", "P2", "P3")
+SAVE_GUARD_US = 20_000
+T_SHOW_US = SAVE_GUARD_US  # Backwards-compatible name; OLED now uses page guard.
+OLED_PAGE_GUARD_US = 6_000
+OLED_FULL_RENDER_GUARD_US = 25_000
+OLED_PAGE_COUNT = OLED_HEIGHT // 8
+INTERNAL_PPQN = 24
+DISPLAY_TIMING_MAX_BPM = 240
+DISPLAY_TIMING_PPQN = INTERNAL_PPQN
+DISPLAY_TIMING_MIN_PERIOD_US = (
+    60_000_000 // (DISPLAY_TIMING_MAX_BPM * DISPLAY_TIMING_PPQN)
+)
 DEBOUNCE_MS = 30
 KNOB_DEADBAND = 0.01
 SAVE_NOTICE_MS = 1_000
 SAVE_NOTICE_TEXT = "SAVED"
+SAVE_PENDING_TEXT = "SAVING"
+SAVE_FAILED_TEXT = "SAVE ERR"
+CLOCK_QUEUE_CAPACITY = 16
+MAX_CLOCK_CATCH_UP = 4
+EXTERNAL_TIMEOUT_PERIODS = 4
+STATE_SCHEMA_VERSION = 2
+
+
+def _clamped_int(value, minimum, maximum, default):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = default
+    return min(max(value, minimum), maximum)
+
+
+class _EuclideanWorkspace:
+    """Fixed scratch storage shared by non-realtime Euclidean regeneration."""
+    __slots__ = ("counts", "remainders", "levels", "children", "scratch")
+
+    def __init__(self):
+        self.counts = bytearray(MAX_STEPS + 1)
+        self.remainders = bytearray(MAX_STEPS + 1)
+        self.levels = bytearray(MAX_STEPS + 1)
+        self.children = bytearray(MAX_STEPS + 1)
+        self.scratch = bytearray(MAX_STEPS)
+
+
+_EUCLIDEAN_WORKSPACE = _EuclideanWorkspace()
+
+
+def _generate_euclidean_into(target, steps, pulses, workspace):
+    """Write canonical Euclid(pulses, steps) into a preallocated buffer.
+
+    The output has the same orientation as the legacy shared generator with
+    ``rot=0``. The iterative expansion and canonicalization use only fixed
+    workspace; rotation deliberately remains a read-time concern.
+    """
+    if steps < MIN_STEPS or steps > MAX_STEPS:
+        raise ValueError("Steps out of range")
+    if pulses < 0 or pulses > steps:
+        raise ValueError("Pulses out of range")
+
+    write_pos = 0
+    if pulses == 0:
+        while write_pos < steps:
+            target[write_pos] = 0
+            write_pos += 1
+        return
+
+    counts = workspace.counts
+    remainders = workspace.remainders
+    divisor = steps - pulses
+    remainders[0] = pulses
+    level = 0
+    while True:
+        counts[level] = divisor // remainders[level]
+        remainders[level + 1] = divisor % remainders[level]
+        divisor = remainders[level]
+        level += 1
+        if remainders[level] <= 1:
+            break
+    counts[level] = divisor
+
+    # Iterative depth-first expansion of the legacy recursive build(level).
+    levels = workspace.levels
+    children = workspace.children
+    stack_pos = 0
+    levels[0] = level + 2  # bytearray cannot store -1/-2, so offset by two.
+    children[0] = 0
+    while stack_pos >= 0:
+        build_level = levels[stack_pos] - 2
+        if build_level == -1:
+            target[write_pos] = 0
+            write_pos += 1
+            stack_pos -= 1
+        elif build_level == -2:
+            target[write_pos] = 1
+            write_pos += 1
+            stack_pos -= 1
+        else:
+            child = children[stack_pos]
+            repeated_children = counts[build_level]
+            if child < repeated_children:
+                children[stack_pos] = child + 1
+                stack_pos += 1
+                levels[stack_pos] = build_level + 1  # (level - 1) + 2
+                children[stack_pos] = 0
+            elif child == repeated_children and remainders[build_level] != 0:
+                children[stack_pos] = child + 1
+                stack_pos += 1
+                levels[stack_pos] = build_level  # (level - 2) + 2
+                children[stack_pos] = 0
+            else:
+                stack_pos -= 1
+
+    # Preserve the legacy orientation: the first pulse is canonical index 0.
+    first_pulse = 0
+    while target[first_pulse] == 0:
+        first_pulse += 1
+    if first_pulse:
+        scratch = workspace.scratch
+        read_pos = 0
+        while read_pos < steps:
+            scratch[read_pos] = target[read_pos]
+            read_pos += 1
+        write_pos = 0
+        read_pos = first_pulse
+        while write_pos < steps:
+            target[write_pos] = scratch[read_pos]
+            write_pos += 1
+            read_pos += 1
+            if read_pos == steps:
+                read_pos = 0
 
 
 # ---------------------------------------------------------------------------
@@ -215,27 +339,51 @@ class ButtonEvent:
 
 
 class ClockEvent:
-    __slots__ = ()
+    __slots__ = ("timestamp_us",)
+
+    def __init__(self, timestamp_us=0):
+        self.timestamp_us = timestamp_us
 
 
-# ---------------------------------------------------------------------------
-# 语义输出事件（硬件无关）
-# ---------------------------------------------------------------------------
+class ClockCapture:
+    """Fixed-capacity timestamp ring used between the DIN ISR and main loop."""
+    __slots__ = ("_timestamps", "_head", "_tail", "_count", "overflows")
 
-class OutputEvent:
-    pass
+    def __init__(self, capacity=CLOCK_QUEUE_CAPACITY):
+        self._timestamps = [0] * capacity
+        self._head = 0
+        self._tail = 0
+        self._count = 0
+        self.overflows = 0
 
+    @property
+    def capacity(self):
+        return len(self._timestamps)
 
-class CVOutputEvent(OutputEvent):
-    """某 CV 通道置为指定电压（电平已由引擎计算后携带）。"""
-    __slots__ = ("channel", "voltage")
-    def __init__(self, channel, voltage):
-        self.channel = channel
-        self.voltage = voltage
+    @property
+    def count(self):
+        return self._count
 
+    def push(self, timestamp_us):
+        if self._count == len(self._timestamps):
+            self.overflows += 1
+            return False
+        self._timestamps[self._tail] = timestamp_us
+        self._tail += 1
+        if self._tail == len(self._timestamps):
+            self._tail = 0
+        self._count += 1
+        return True
 
-class ClockOutputEvent(OutputEvent):
-    __slots__ = ()
+    def pop(self):
+        if self._count == 0:
+            return None
+        timestamp_us = self._timestamps[self._head]
+        self._head += 1
+        if self._head == len(self._timestamps):
+            self._head = 0
+        self._count -= 1
+        return timestamp_us
 
 
 # ---------------------------------------------------------------------------
@@ -243,20 +391,16 @@ class ClockOutputEvent(OutputEvent):
 # ---------------------------------------------------------------------------
 
 class Param:
-    """一个 K2 可编辑的参数槽。pmin / pmax 可为 int 或 callable(ctx)（动态范围）。
+    """Static parameter descriptor with a direct, allocation-free setter."""
+    __slots__ = ("abbr", "pmin", "pmax", "discrete", "_get", "_set", "_fmt")
 
-    get_cur(ctx) 读取当前值；make(ctx, v) 造命令；fmt(ctx) 顶栏显示。
-    ctx 对全局参数 = transport，对轨道参数 = track。
-    """
-    __slots__ = ("abbr", "pmin", "pmax", "discrete", "_get", "_make", "_fmt")
-
-    def __init__(self, abbr, pmin, pmax, discrete, get_cur, make_cmd, fmt):
+    def __init__(self, abbr, pmin, pmax, discrete, get_cur, set_value, fmt):
         self.abbr = abbr
         self.pmin = pmin
         self.pmax = pmax
         self.discrete = discrete
         self._get = get_cur
-        self._make = make_cmd
+        self._set = set_value
         self._fmt = fmt
 
     def _resolve(self, ctx, v):
@@ -265,8 +409,8 @@ class Param:
     def get_cur(self, ctx):
         return self._get(ctx)
 
-    def make(self, ctx, v):
-        return self._make(ctx, v)
+    def set_value(self, ctx, value):
+        self._set(ctx, value)
 
     def fmt(self, ctx):
         return self._fmt(ctx)
@@ -284,28 +428,29 @@ class Param:
             return
         if val == cur:
             return
-        exec_cmd(self._make(ctx, val))
+        exec_cmd(self, ctx, val)
 
 
 class StepSlot:
     """CV 序列的步槽：编辑第 idx 步的 0~127 值。"""
-    __slots__ = ("idx",)
+    __slots__ = ("idx", "_abbr")
     pmin = 0
     pmax = CV_VAL_MAX
     discrete = False
 
     def __init__(self, idx):
         self.idx = idx
+        self._abbr = "S%02d" % (idx + 1)
 
     @property
     def abbr(self):
-        return f"S{self.idx + 1:02d}"
+        return self._abbr
 
     def get_cur(self, track):
         return track.engine.values[self.idx]
 
-    def make(self, track, v):
-        return SetCVStep(track.engine, self.idx, v)
+    def set_value(self, track, value):
+        track.engine.set_step(self.idx, value)
 
     def fmt(self, track):
         # 编辑步时只显示 cv 数值（0~127），不显示电压换算
@@ -317,105 +462,7 @@ class StepSlot:
         val = min(max(val, 0), CV_VAL_MAX)
         if val == self.get_cur(track):
             return
-        exec_cmd(self.make(track, val))
-
-
-# ---------------------------------------------------------------------------
-# 命令（Controller → Model 统一出口）
-# ---------------------------------------------------------------------------
-
-class Command:
-    def execute(self):
-        raise NotImplementedError
-
-
-class SetTransportSource(Command):
-    def __init__(self, transport, src):
-        self._t, self._v = transport, src
-    def execute(self):
-        self._t.set_source(self._v)
-
-
-class ToggleInternalClock(Command):
-    def __init__(self, transport):
-        self._t = transport
-    def execute(self):
-        self._t.toggle_internal_clock()
-
-
-class SetBpm(Command):
-    def __init__(self, transport, bpm):
-        self._t, self._v = transport, bpm
-    def execute(self):
-        self._t.set_bpm(self._v)
-
-
-class SetMul(Command):
-    def __init__(self, transport, mul):
-        self._t, self._v = transport, mul
-    def execute(self):
-        self._t.set_mul(self._v)
-
-
-class SetTrackType(Command):
-    def __init__(self, track, typ, app=None):
-        self._t, self._v, self._app = track, typ, app
-    def execute(self):
-        self._t.set_type(self._v)
-        if self._app is not None:
-            self._app.k2_picked = False
-            # 仅在轨道页切换类型时归零选择；全局页(P0)保持当前 T 槽位，避免跳回 CLK
-            if self._app.page != 0:
-                self._app.sel = 0
-
-
-class SetTrackVLo(Command):
-    def __init__(self, track, v):
-        self._t, self._v = track, v
-    def execute(self):
-        self._t.set_v_lo(self._v)
-
-
-class SetTrackVHi(Command):
-    def __init__(self, track, v):
-        self._t, self._v = track, v
-    def execute(self):
-        self._t.set_v_hi(self._v)
-
-
-class SetTrackParam(Command):
-    def __init__(self, track, which, attr, val):
-        self._t, self._w, self._a, self._v = track, which, attr, val
-    def execute(self):
-        self._t.set_gen(self._w, self._a, self._v)
-
-
-class SetMerge(Command):
-    def __init__(self, track, val):
-        self._t, self._v = track, val
-    def execute(self):
-        self._t.set_merge(self._v)
-
-
-class SetCVLength(Command):
-    def __init__(self, engine, n):
-        self._e, self._v = engine, n
-    def execute(self):
-        self._e.set_length(self._v)
-
-
-class SetCVStep(Command):
-    def __init__(self, engine, idx, val):
-        self._e, self._i, self._v = engine, idx, val
-    def execute(self):
-        self._e.set_step(self._i, self._v)
-
-
-class SetCVGateLen(Command):
-    def __init__(self, engine, pct):
-        self._e, self._v = engine, pct
-    def execute(self):
-        self._e.set_gate_len(self._v)
+        exec_cmd(self, track, val)
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +483,8 @@ class Hardware:
             "b1": {"state": False, "pending": False, "t": 0},
             "b2": {"state": False, "pending": False, "t": 0},
         }
-        self._clock_q = []
+        self.clock_capture = ClockCapture()
+        self.clock_schedule_failures = 0
         self.on_clock_rise(self._push_clock)
 
     def _debounced(self, key, raw):
@@ -464,26 +512,32 @@ class Hardware:
     def button2(self):
         return self._debounced("b2", self.b2.value() == HIGH)
 
-    def _push_clock(self, _=None):
-        self._clock_q.append(ClockEvent())
+    def _push_clock(self, timestamp_us=None):
+        if timestamp_us is None:
+            timestamp_us = ticks_us()
+        self.clock_capture.push(timestamp_us)
 
-    def take_clock_events(self):
-        if not self._clock_q:
-            return []
-        q = self._clock_q
-        self._clock_q = []
-        return q
+    def pop_clock_timestamp(self):
+        return self.clock_capture.pop()
+
+    @property
+    def clock_overflows(self):
+        return self.clock_capture.overflows
+
+    @property
+    def dropped_clock_events(self):
+        return self.clock_capture.overflows + self.clock_schedule_failures
 
     def on_clock_rise(self, cb):
         pin = self.din.pin
         def _isr(*_):
             try:
-                micropython.schedule(cb, None)
+                micropython.schedule(cb, ticks_us())
             except (ValueError, RuntimeError):
-                pass
+                self.clock_schedule_failures += 1
         pin.irq(trigger=pin.IRQ_FALLING, handler=_isr)
 
-    # --- CV 输出（输出事件的落点）---
+    # --- CV 输出落点 ---
     def set_cv(self, idx, voltage):
         if 0 <= idx < len(self.cv):
             self.cv[idx].voltage(voltage)
@@ -501,6 +555,9 @@ class Hardware:
 
     def display_show(self):
         self.oled.show()
+
+    def display_show_page(self, page):
+        self.oled.show_page(page)
 
     def display_text(self, s, x, y):
         self.oled.text(s, x, y, 1)
@@ -526,6 +583,7 @@ class InputManager:
         self._knob2 = KnobTurn(2, 0.0)
         self._knob1_last = -1.0
         self._knob2_last = -1.0
+        self._clock_events = [ClockEvent() for _ in range(CLOCK_QUEUE_CAPACITY)]
 
     def poll(self):
         events = []
@@ -571,8 +629,15 @@ class InputManager:
             self._knob2.value = v2
             events.append(self._knob2)
 
-        for c in self.hw.take_clock_events():
-            events.append(c)
+        clock_index = 0
+        while clock_index < CLOCK_QUEUE_CAPACITY:
+            timestamp_us = self.hw.pop_clock_timestamp()
+            if timestamp_us is None:
+                break
+            clock_event = self._clock_events[clock_index]
+            clock_event.timestamp_us = timestamp_us
+            events.append(clock_event)
+            clock_index += 1
         return events
 
 
@@ -599,18 +664,64 @@ class Pattern:
 
 class EuclidPattern(Pattern):
     def __init__(self, steps, pulses, rot, prob):
-        self.steps = steps
-        self.pulses = pulses
-        self.rot = rot
-        self.prob = prob
-        self.pattern = []
-        self.regenerate()
+        steps = _clamped_int(steps, MIN_STEPS, MAX_STEPS, MIN_STEPS)
+        pulses = _clamped_int(pulses, 0, steps, 0)
+        self.rot = _clamped_int(rot, 0, steps, 0)
+        self.prob = _clamped_int(prob, 0, 100, 100)
+        self._buffers = (bytearray(MAX_STEPS), bytearray(MAX_STEPS))
+        self._slot_steps = bytearray(2)
+        self._slot_pulses = bytearray(2)
+        self._active_index = 0
+        self._slot_steps[0] = steps
+        self._slot_pulses[0] = pulses
+        _generate_euclidean_into(
+            self._buffers[0], steps, pulses, _EUCLIDEAN_WORKSPACE
+        )
 
-    def regenerate(self):
-        self.pattern = generate_euclidean_pattern(self.steps, self.pulses, self.rot)
+    @property
+    def steps(self):
+        return self._slot_steps[self._active_index]
+
+    @property
+    def pulses(self):
+        return self._slot_pulses[self._active_index]
+
+    @property
+    def pattern(self):
+        """Canonical, unrotated active buffer; consumers should use value_at()."""
+        return self._buffers[self._active_index]
+
+    def regenerate(self, steps=None, pulses=None):
+        if steps is None:
+            steps = self.steps
+        if pulses is None:
+            pulses = self.pulses
+        if steps == self.steps and pulses == self.pulses:
+            return False
+
+        inactive = 1 - self._active_index
+        _generate_euclidean_into(
+            self._buffers[inactive], steps, pulses, _EUCLIDEAN_WORKSPACE
+        )
+        self._slot_steps[inactive] = steps
+        self._slot_pulses[inactive] = pulses
+        # Publish metadata and its completed buffer together from readers' view.
+        self._active_index = inactive
+        return True
+
+    def value_at(self, pos):
+        active = self._active_index
+        steps = self._slot_steps[active]
+        source_pos = pos - self.rot
+        if source_pos < 0:
+            source_pos += steps
+        return self._buffers[active][source_pos]
+
+    def is_on(self, pos):
+        return bool(self.value_at(pos))
 
     def output(self, pos):
-        if not self.pattern[pos]:
+        if not self.is_on(pos):
             return False
         if self.prob >= 100:
             return True
@@ -619,39 +730,44 @@ class EuclidPattern(Pattern):
         return random.random() < self.prob / 100.0
 
     def set_steps(self, steps):
-        self.steps = min(max(steps, MIN_STEPS), MAX_STEPS)
-        if self.pulses > self.steps:
-            self.pulses = steps
+        steps = _clamped_int(steps, MIN_STEPS, MAX_STEPS, self.steps)
+        pulses = min(self.pulses, steps)
+        # Clamp rotation before publishing a potentially shorter pattern so an
+        # interrupting reader always observes an in-range offset.
         if self.rot > steps:
             self.rot = steps
-        self.regenerate()
+        self.regenerate(steps, pulses)
 
     def set_pulses(self, pulses):
-        self.pulses = min(max(pulses, 0), self.steps)
-        self.regenerate()
+        pulses = _clamped_int(pulses, 0, self.steps, self.pulses)
+        self.regenerate(self.steps, pulses)
 
     def set_rot(self, rot):
-        self.rot = min(max(rot, 0), self.steps)
-        self.regenerate()
+        self.rot = _clamped_int(rot, 0, self.steps, self.rot)
 
     def set_prob(self, prob):
-        self.prob = min(max(prob, 0), 100)
+        self.prob = _clamped_int(prob, 0, 100, self.prob)
 
     def to_dict(self):
         return {"steps": self.steps, "pulses": self.pulses,
                 "rot": self.rot, "prob": self.prob}
 
     def from_dict(self, d):
-        if not d:
+        if not isinstance(d, dict) or not d:
             return
-        self.steps = d.get("steps", self.steps)
-        self.pulses = d.get("pulses", self.pulses)
-        self.rot = d.get("rot", self.rot)
-        self.prob = d.get("prob", self.prob)
-        self.regenerate()
+        steps = _clamped_int(
+            d.get("steps", self.steps), MIN_STEPS, MAX_STEPS, self.steps
+        )
+        pulses = _clamped_int(d.get("pulses", self.pulses), 0, steps, self.pulses)
+        rot = _clamped_int(d.get("rot", self.rot), 0, steps, self.rot)
+        prob = _clamped_int(d.get("prob", self.prob), 0, 100, self.prob)
+        self.rot = min(rot, self.steps)
+        self.regenerate(steps, pulses)
+        self.rot = rot
+        self.prob = prob
 
 
-class TrackPlayer:
+class EuclidRuntime:
     def __init__(self, patterns, merge):
         self.patterns = patterns
         self.merge = merge
@@ -659,35 +775,35 @@ class TrackPlayer:
         self.last_out = False
 
     def output(self):
-        ons = []
-        for i, p in enumerate(self.patterns):
-            self.positions[i] = (self.positions[i] + 1) % p.steps
-            ons.append(p.output(self.positions[i]))
-        out = combine_outputs(ons[0], ons[1], self.merge)
+        pattern = self.patterns[0]
+        position = (self.positions[0] + 1) % pattern.steps
+        self.positions[0] = position
+        on1 = EuclidPattern.output(pattern, position)
+
+        pattern = self.patterns[1]
+        position = (self.positions[1] + 1) % pattern.steps
+        self.positions[1] = position
+        on2 = EuclidPattern.output(pattern, position)
+
+        out = combine_outputs(on1, on2, self.merge)
         self.last_out = out
         return out
 
     def reset(self):
-        self.positions = [p.steps - 1 for p in self.patterns]
+        self.positions[0] = self.patterns[0].steps - 1
+        self.positions[1] = self.patterns[1].steps - 1
         self.last_out = False
 
-    def to_dict(self):
-        return {"positions": list(self.positions), "last_out": self.last_out}
 
-    def from_dict(self, d):
-        if not d:
-            return
-        pos = d.get("positions")
-        if pos:
-            self.positions = pos
-        self.last_out = d.get("last_out", self.last_out)
+# Backwards-compatible name; runtime state is intentionally not serializable.
+TrackPlayer = EuclidRuntime
 
 
 # ---------------------------------------------------------------------------
-# TrackEngine 接口与两种引擎
+# TrackConfig 接口与两种配置
 # ---------------------------------------------------------------------------
 
-class TrackEngine:
+class TrackConfig:
     TYPE = ""
 
     def param_defs(self, track):
@@ -697,13 +813,10 @@ class TrackEngine:
         return 0
 
     def slots(self, track):
-        return self.param_defs(track) + [StepSlot(i) for i in range(self.step_slots(track))]
-
-    def tick(self, ch, settings, bus, now_us, track, transport):
-        raise NotImplementedError
-
-    def reset(self):
-        raise NotImplementedError
+        count = self.step_slots(track)
+        if count == 0:
+            return self.param_defs(track)
+        return self.param_defs(track) + [StepSlot(i) for i in range(count)]
 
     def to_dict(self):
         raise NotImplementedError
@@ -712,7 +825,11 @@ class TrackEngine:
         raise NotImplementedError
 
 
-class EuclidEngine(TrackEngine):
+# Backwards-compatible name retained for external imports.
+TrackEngine = TrackConfig
+
+
+class EuclidEngine(TrackConfig):
     TYPE = "EUC"
 
     def __init__(self, g1, g2, merge):
@@ -720,169 +837,428 @@ class EuclidEngine(TrackEngine):
         self.g2 = g2
         self.patterns = [g1, g2]
         self.merge = merge
-        self.player = TrackPlayer(self.patterns, merge)
-        self.last_out = False
+        self._params = None
 
     def set_merge(self, v):
         self.merge = v
-        self.player.merge = v
 
     def param_defs(self, track):
-        return [
+        if self._params is not None:
+            return self._params
+        self._params = [
             Param("ROT1", 0, lambda t: self.g1.steps, False,
                   lambda t: self.g1.rot,
-                  lambda t, v: SetTrackParam(track, 1, "rot", v),
+                  lambda t, v: t.set_gen(1, "rot", v),
                   lambda t: self.g1.rot),
             Param("ROT2", 0, lambda t: self.g2.steps, False,
                   lambda t: self.g2.rot,
-                  lambda t, v: SetTrackParam(track, 2, "rot", v),
+                  lambda t, v: t.set_gen(2, "rot", v),
                   lambda t: self.g2.rot),
             Param("PLS1", 0, lambda t: self.g1.steps, False,
                   lambda t: self.g1.pulses,
-                  lambda t, v: SetTrackParam(track, 1, "pulses", v),
+                  lambda t, v: t.set_gen(1, "pulses", v),
                   lambda t: self.g1.pulses),
             Param("PLS2", 0, lambda t: self.g2.steps, False,
                   lambda t: self.g2.pulses,
-                  lambda t, v: SetTrackParam(track, 2, "pulses", v),
+                  lambda t, v: t.set_gen(2, "pulses", v),
                   lambda t: self.g2.pulses),
             Param("STP1", MIN_STEPS, MAX_STEPS, False,
                   lambda t: self.g1.steps,
-                  lambda t, v: SetTrackParam(track, 1, "steps", v),
+                  lambda t, v: t.set_gen(1, "steps", v),
                   lambda t: self.g1.steps),
             Param("STP2", MIN_STEPS, MAX_STEPS, False,
                   lambda t: self.g2.steps,
-                  lambda t, v: SetTrackParam(track, 2, "steps", v),
+                  lambda t, v: t.set_gen(2, "steps", v),
                   lambda t: self.g2.steps),
             Param("PRB1", 0, 100, False,
                   lambda t: self.g1.prob,
-                  lambda t, v: SetTrackParam(track, 1, "prob", v),
+                  lambda t, v: t.set_gen(1, "prob", v),
                   lambda t: self.g1.prob),
             Param("PRB2", 0, 100, False,
                   lambda t: self.g2.prob,
-                  lambda t, v: SetTrackParam(track, 2, "prob", v),
+                  lambda t, v: t.set_gen(2, "prob", v),
                   lambda t: self.g2.prob),
             Param("MERG", 0, 4, True,
                   lambda t: self.merge,
-                  lambda t, v: SetMerge(track, v),
+                  lambda t, v: t.set_merge(v),
                   lambda t: MERGE_MODES[self.merge]),
         ]
-
-    def tick(self, ch_pitch, ch_gate, settings, bus, now_us, track, transport):
-        on = self.player.output()
-        self.last_out = on
-        v_hi = settings.v_hi
-        v_lo = settings.v_lo
-        # EUC 固定配对双通道：第一个 CV（cv1~3）出门（欧几里得节奏），
-        # 第二个 CV（cv4~6）出时钟（每个步稳定脉冲）
-        if on:
-            bus.emit(CVOutputEvent(ch_pitch, v_hi))
-            bus.emit_after(GATE_MS * 1000, CVOutputEvent(ch_pitch, v_lo))
-        else:
-            bus.emit(CVOutputEvent(ch_pitch, v_lo))
-        bus.emit(CVOutputEvent(ch_gate, v_hi))
-        bus.emit_after(GATE_MS * 1000, CVOutputEvent(ch_gate, v_lo))
-
-    def reset(self):
-        self.player.reset()
+        return self._params
 
     def to_dict(self):
         return {"g1": self.g1.to_dict(), "g2": self.g2.to_dict(),
                 "merge": self.merge}
 
     def from_dict(self, d):
-        if not d:
+        if not isinstance(d, dict) or not d:
             return
-        self.g1.from_dict(d.get("g1", {}))
-        self.g2.from_dict(d.get("g2", {}))
-        self.merge = d.get("merge", self.merge)
-        self.player = TrackPlayer(self.patterns, self.merge)
+        g1 = d.get("g1", {})
+        g2 = d.get("g2", {})
+        if isinstance(g1, dict):
+            self.g1.from_dict(g1)
+        if isinstance(g2, dict):
+            self.g2.from_dict(g2)
+        self.merge = _clamped_int(d.get("merge", self.merge), 0, 4, self.merge)
 
 
-class CVSeqEngine(TrackEngine):
+class CVSeqEngine(TrackConfig):
     TYPE = "CVSEQ"
 
     def __init__(self):
         self.length = 8
         self.values = [(i * CV_VAL_MAX) // (CV_LEN - 1) for i in range(CV_LEN)]
         self.gate_len = 50   # 门长度（占每步百分比），恒定输出在配对门通道
-        self.pos = 0
-        self.gate_last = False
+        self._params = None
+        self._slots = None
 
     def param_defs(self, track):
-        params = [
+        if self._params is not None:
+            return self._params
+        self._params = [
             Param("LEN", 1, CV_LEN, True,
                   lambda t: t.engine.length,
-                  lambda t, v: SetCVLength(t.engine, v),
+                  lambda t, v: t.engine.set_length(v),
                   lambda t: t.engine.length),
             Param("VLO", CV_MIN, CV_MAX, False,
                   lambda t: t.v_lo,
-                  lambda t, v: SetTrackVLo(t, v),
+                  lambda t, v: t.set_v_lo(v),
                   lambda t: f"{t.v_lo}V"),
             Param("VHI", CV_MIN, CV_MAX, False,
                   lambda t: t.v_hi,
-                  lambda t, v: SetTrackVHi(t, v),
+                  lambda t, v: t.set_v_hi(v),
                   lambda t: f"{t.v_hi}V"),
-        ]
-        params.append(
-            Param("GLEN", 5, 100, False,
+            Param("GLEN", CV_GATE_MIN, CV_GATE_MAX, False,
                   lambda t: t.engine.gate_len,
-                  lambda t, v: SetCVGateLen(t.engine, v),
+                  lambda t, v: t.engine.set_gate_len(v),
                   lambda t: f"{t.engine.gate_len}%")
-        )
-        return params
+        ]
+        return self._params
+
+    def slots(self, track):
+        if self._slots is None:
+            self._slots = self.param_defs(track) + [
+                StepSlot(index) for index in range(CV_LEN)
+            ]
+        return self._slots
 
     def step_slots(self, track):
         return self.length
 
     def set_length(self, n):
         # values 固定为 CV_LEN 长度，缩短只改变播放窗口，不破坏已编辑音型
-        self.length = min(max(n, 1), CV_LEN)
+        self.length = _clamped_int(n, 1, CV_LEN, self.length)
 
     def set_step(self, i, v):
         if 0 <= i < CV_LEN:
-            self.values[i] = min(max(v, 0), CV_VAL_MAX)
+            self.values[i] = _clamped_int(v, 0, CV_VAL_MAX, self.values[i])
 
     def set_gate_len(self, pct):
-        self.gate_len = min(max(pct, 5), 100)
+        self.gate_len = _clamped_int(
+            pct, CV_GATE_MIN, CV_GATE_MAX, self.gate_len
+        )
 
-    def tick(self, ch_pitch, ch_gate, settings, bus, now_us, track, transport):
-        self.pos = (self.pos + 1) % self.length
-        v = self.values[self.pos]
-        volt = settings.v_lo + (settings.v_hi - settings.v_lo) * v / CV_VAL_MAX
-        bus.emit(CVOutputEvent(ch_pitch, volt))
-        # 配对门通道（cv4~6）输出门脉冲，长度由 GLEN 决定；cv=0 时不出门
-        if v > 0:
-            step_us = transport.beat_us()
-            glen_us = step_us * self.gate_len // 100
-            bus.emit(CVOutputEvent(ch_gate, settings.v_hi))
-            bus.emit_after(glen_us, CVOutputEvent(ch_gate, settings.v_lo))
-        self.gate_last = v > 0
+    def to_project_dict(self):
+        return {"length": self.length,
+                "values": list(self.values),
+                "gate_len": self.gate_len}
+
+    def from_dict(self, d):
+        if not isinstance(d, dict) or not d:
+            return
+        self.length = _clamped_int(d.get("length", self.length), 1, CV_LEN, self.length)
+        vals = d.get("values", [])
+        if isinstance(vals, (list, tuple)):
+            index = 0
+            while index < CV_LEN:
+                if index < len(vals):
+                    self.values[index] = _clamped_int(
+                        vals[index], 0, CV_VAL_MAX, self.values[index]
+                    )
+                index += 1
+        self.gate_len = _clamped_int(
+            d.get("gate_len", self.gate_len),
+            CV_GATE_MIN,
+            CV_GATE_MAX,
+            self.gate_len,
+        )
+
+    def from_project_dict(self, d):
+        self.from_dict(d)
+
+
+class CVSeqRuntime:
+    __slots__ = ("pos", "gate_last")
+
+    def __init__(self):
+        self.pos = 0
+        self.gate_last = False
+
+    def on_tick(self, config, track, outputs, context):
+        self.pos = (self.pos + 1) % config.length
+        value = config.values[self.pos]
+        voltage = track.v_lo + (track.v_hi - track.v_lo) * value / CV_VAL_MAX
+        outputs.set_cv(track.cv_index, voltage)
+        if value > 0:
+            gate_us = context.period_us * config.gate_len // 100
+            outputs.trigger_gate(
+                track.gate_index,
+                track.v_hi,
+                track.v_lo,
+                gate_us,
+                context.actual_us,
+            )
+        else:
+            outputs.cancel_channel(track.gate_index, track.v_lo)
+        self.gate_last = value > 0
 
     def reset(self):
         self.pos = 0
         self.gate_last = False
 
-    def to_dict(self):
-        return {"length": self.length,
-                "values": list(self.values),
-                "gate_len": self.gate_len,
-                "pos": self.pos}
-
-    def from_dict(self, d):
-        if not d:
-            return
-        self.length = min(max(d.get("length", self.length), 1), CV_LEN)
-        vals = d.get("values", [])
-        self.values = [min(max(x, 0), CV_VAL_MAX) for x in vals[:CV_LEN]]
-        while len(self.values) < CV_LEN:
-            self.values.append(0)
-        self.gate_len = min(max(d.get("gate_len", self.gate_len), 5), 100)
-        self.pos = d.get("pos", 0) % self.length
-
 
 # ---------------------------------------------------------------------------
 # Track —— 容器：设置 + 引擎实例（常驻）
 # ---------------------------------------------------------------------------
+
+class TrackFeature:
+    __slots__ = ("type_id", "engine_key", "project_key")
+
+    def __init__(self, type_id, engine_key=None, project_key=None):
+        self.type_id = type_id
+        self.engine_key = engine_key
+        self.project_key = project_key
+
+    def create_engine(self, track, g1, g2, merge):
+        return None
+
+    def create_runtime(self, track, engine):
+        return engine
+
+    def engine(self, track):
+        if self.engine_key is None:
+            return None
+        return track.engines[self.engine_key]
+
+    def runtime(self, track):
+        if self.engine_key is None:
+            return None
+        return track.runtimes[self.engine_key]
+
+    def slots(self, track):
+        engine = self.engine(track)
+        return () if engine is None else engine.slots(track)
+
+    def slot_count(self, track):
+        return len(self.slots(track))
+
+    def reset(self, track):
+        runtime = self.runtime(track)
+        if runtime is not None:
+            runtime.reset()
+
+    def on_tick(self, track, outputs, context):
+        raise NotImplementedError
+
+    def update(self, track, outputs, now_us, context):
+        pass
+
+    def write_snapshot(self, track, app, transport, snapshot):
+        raise NotImplementedError
+
+    def render(self, snapshot, hw):
+        raise NotImplementedError
+
+    def render_dynamic(self, snapshot, hw):
+        self.render(snapshot, hw)
+
+    def encode_project(self, track):
+        return None
+
+    def decode_project(self, track, data, project=False):
+        pass
+
+
+class NullTrackFeature(TrackFeature):
+    def __init__(self):
+        super().__init__("OFF")
+
+    def on_tick(self, track, outputs, context):
+        outputs.cancel_channel(track.cv_index, 0)
+        outputs.cancel_channel(track.gate_index, 0)
+
+    def write_snapshot(self, track, app, transport, snapshot):
+        pass
+
+    def render(self, snapshot, hw):
+        hw.display_text("OFF", 52, 12)
+
+
+class EuclidTrackFeature(TrackFeature):
+    def __init__(self):
+        super().__init__("EUC", "EUC", "EUC")
+
+    def create_engine(self, track, g1, g2, merge):
+        return EuclidEngine(g1, g2, merge)
+
+    def create_runtime(self, track, engine):
+        return EuclidRuntime(engine.patterns, engine.merge)
+
+    def on_tick(self, track, outputs, context):
+        runtime = track.runtimes["EUC"]
+        on = EuclidRuntime.output(runtime)
+        if on:
+            outputs.trigger_gate(
+                track.cv_index,
+                track.v_hi,
+                track.v_lo,
+                GATE_MS * 1000,
+                context.actual_us,
+            )
+        else:
+            outputs.cancel_channel(track.cv_index, track.v_lo)
+        outputs.trigger_gate(
+            track.gate_index,
+            track.v_hi,
+            track.v_lo,
+            GATE_MS * 1000,
+            context.actual_us,
+        )
+
+    def write_snapshot(self, track, app, transport, snapshot):
+        engine = track.engines["EUC"]
+        current = transport.beat_index - 1 if transport.beat_index > 0 else 0
+        window_start = (current // 16) * 16
+        column = 0
+        while column < 16:
+            snapshot.sequence_a[column] = engine.g1.is_on(
+                (window_start + column) % engine.g1.steps
+            )
+            snapshot.sequence_b[column] = engine.g2.is_on(
+                (window_start + column) % engine.g2.steps
+            )
+            column += 1
+        snapshot.playhead = current % 16
+        snapshot.last_output = track.runtimes["EUC"].last_out
+
+    def render(self, snapshot, hw):
+        row = 0
+        while row < 2:
+            bits = snapshot.sequence_a if row == 0 else snapshot.sequence_b
+            y = 8 if row == 0 else 16
+            column = 0
+            while column < 16:
+                if bits[column]:
+                    hw.display_fill_rect(column * 8, y, 6, 6, 1)
+                else:
+                    hw.display_fill_rect(column * 8 + 2, y + 2, 2, 2, 1)
+                column += 1
+            row += 1
+        if snapshot.last_output:
+            hw.display_fill_rect(snapshot.playhead * 8, 26, 6, 6, 1)
+        else:
+            hw.display_fill_rect(snapshot.playhead * 8 + 2, 28, 2, 2, 1)
+
+    def render_dynamic(self, snapshot, hw):
+        hw.display_fill_rect(0, 26, OLED_WIDTH, 6, 0)
+        if snapshot.last_output:
+            hw.display_fill_rect(snapshot.playhead * 8, 26, 6, 6, 1)
+        else:
+            hw.display_fill_rect(snapshot.playhead * 8 + 2, 28, 2, 2, 1)
+
+    def encode_project(self, track):
+        return track.engines["EUC"].to_dict()
+
+    def decode_project(self, track, data, project=False):
+        engine = track.engines["EUC"]
+        engine.from_dict(data)
+        runtime = track.runtimes["EUC"]
+        runtime.merge = engine.merge
+        runtime.reset()
+
+
+class CVTrackFeature(TrackFeature):
+    def __init__(self):
+        super().__init__("CV", "CVSEQ", "CVSEQ")
+
+    def create_engine(self, track, g1, g2, merge):
+        return CVSeqEngine()
+
+    def create_runtime(self, track, engine):
+        return CVSeqRuntime()
+
+    def slot_count(self, track):
+        engine = track.engines["CVSEQ"]
+        return len(engine.param_defs(track)) + engine.length
+
+    def on_tick(self, track, outputs, context):
+        CVSeqRuntime.on_tick(
+            track.runtimes["CVSEQ"],
+            track.engines["CVSEQ"],
+            track,
+            outputs,
+            context,
+        )
+
+    def write_snapshot(self, track, app, transport, snapshot):
+        engine = track.engines["CVSEQ"]
+        index = 0
+        while index < CV_LEN:
+            snapshot.cv_values[index] = engine.values[index]
+            index += 1
+        snapshot.cv_length = engine.length
+        snapshot.cv_position = track.runtimes["CVSEQ"].pos
+        selected = app.sel - len(engine.param_defs(track))
+        snapshot.selected_step = selected if 0 <= selected < engine.length else -1
+
+    def render(self, snapshot, hw):
+        column = 0
+        while column < CV_LEN:
+            if column < snapshot.cv_length:
+                height = round(snapshot.cv_values[column] / CV_VAL_MAX * 16)
+                if height > 0:
+                    hw.display_fill_rect(column * 8, 25 - height, 6, height, 1)
+            else:
+                hw.display_fill_rect(column * 8 + 2, 25, 2, 1, 1)
+            column += 1
+        if snapshot.selected_step >= 0:
+            hw.display_fill_rect(snapshot.selected_step * 8, 29, 6, 1, 1)
+        if 0 <= snapshot.cv_position < CV_LEN:
+            hw.display_fill_rect(snapshot.cv_position * 8, 27, 6, 3, 1)
+
+    def render_dynamic(self, snapshot, hw):
+        hw.display_fill_rect(0, 27, OLED_WIDTH, 3, 0)
+        if snapshot.selected_step >= 0:
+            hw.display_fill_rect(snapshot.selected_step * 8, 29, 6, 1, 1)
+        if 0 <= snapshot.cv_position < CV_LEN:
+            hw.display_fill_rect(snapshot.cv_position * 8, 27, 6, 3, 1)
+
+    def encode_project(self, track):
+        return track.engines["CVSEQ"].to_project_dict()
+
+    def decode_project(self, track, data, project=False):
+        engine = track.engines["CVSEQ"]
+        engine.from_dict(data)
+        runtime = track.runtimes["CVSEQ"]
+        if project:
+            runtime.reset()
+        else:
+            runtime.pos = _clamped_int(
+                data.get("pos", 0), 0, engine.length - 1, 0
+            )
+            runtime.gate_last = False
+
+
+TRACK_FEATURES = {}
+
+
+def register_track_feature(feature):
+    TRACK_FEATURES[feature.type_id] = feature
+
+
+register_track_feature(NullTrackFeature())
+register_track_feature(EuclidTrackFeature())
+register_track_feature(CVTrackFeature())
+
 
 class Track:
     def __init__(self, idx, g1, g2, merge):
@@ -893,20 +1269,40 @@ class Track:
         # 固定配对：主通道 = cv(idx)，门/钟通道 = cv(idx+3)
         self.cv_index = idx
         self.gate_index = idx + 3
-        self.engines = {
-            "EUC": EuclidEngine(g1, g2, merge),
-            "CVSEQ": CVSeqEngine(),
-        }
+        self.engines = {}
+        for feature in TRACK_FEATURES.values():
+            engine = feature.create_engine(self, g1, g2, merge)
+            if engine is not None:
+                self.engines[feature.engine_key] = engine
+        self.runtimes = {}
+        for feature in TRACK_FEATURES.values():
+            engine = self.engines.get(feature.engine_key)
+            runtime = feature.create_runtime(self, engine)
+            if runtime is not None:
+                self.runtimes[feature.engine_key] = runtime
+        # Allocate all built-in descriptors and step slots before playback.
+        for feature in TRACK_FEATURES.values():
+            feature.slots(self)
+        self._feature = TRACK_FEATURES[self.type]
+        self._on_tick = self._feature.on_tick
+        self._update = self._feature.update
 
     @property
     def engine(self):
-        return self.engines["EUC"] if self.type == "EUC" else self.engines["CVSEQ"]
+        return self.feature.engine(self)
+
+    @property
+    def feature(self):
+        return self._feature
 
     def set_type(self, typ):
-        if typ not in TYPE_NAMES:
+        if typ not in TRACK_FEATURES:
             return
         self.type = typ
-        self.engine.reset()  # 播放头归零，与其他轨对齐
+        self._feature = TRACK_FEATURES[typ]
+        self._on_tick = self._feature.on_tick
+        self._update = self._feature.update
+        self._feature.reset(self)  # 播放头归零，与其他轨对齐
 
     def set_v_lo(self, v):
         v = min(max(v, CV_MIN), CV_MAX)
@@ -933,109 +1329,427 @@ class Track:
 
     def set_merge(self, val):
         self.engines["EUC"].set_merge(val)
+        self.runtimes["EUC"].merge = val
 
     def to_dict(self):
+        cvseq = self.engines["CVSEQ"].to_project_dict()
+        cvseq["pos"] = self.runtimes["CVSEQ"].pos
         return {
             "type": self.type,
             "v_lo": self.v_lo,
             "v_hi": self.v_hi,
             "EUC": self.engines["EUC"].to_dict(),
-            "CVSEQ": self.engines["CVSEQ"].to_dict(),
+            "CVSEQ": cvseq,
         }
 
+    def to_project_dict(self):
+        data = {
+            "type": self.type,
+            "v_lo": self.v_lo,
+            "v_hi": self.v_hi,
+        }
+        for feature in TRACK_FEATURES.values():
+            if feature.project_key is not None:
+                feature_data = feature.encode_project(self)
+                if feature_data is not None:
+                    data[feature.project_key] = feature_data
+        return data
+
     def from_dict(self, d):
-        if not d:
+        self._load_dict(d, False)
+
+    def _load_dict(self, d, project):
+        if not isinstance(d, dict) or not d:
             return
-        self.type = d.get("type", self.type)
-        if self.type not in TYPE_NAMES:
+        track_type = d.get("type", self.type)
+        if track_type in TYPE_NAMES:
+            self.type = track_type
+        elif "type" in d:
             self.type = "EUC"
-        self.v_lo = d.get("v_lo", self.v_lo)
-        self.v_hi = d.get("v_hi", self.v_hi)
-        self.engines["EUC"].from_dict(d.get("EUC", {}))
-        self.engines["CVSEQ"].from_dict(d.get("CVSEQ", {}))
+        self._feature = TRACK_FEATURES[self.type]
+        self._on_tick = self._feature.on_tick
+        self._update = self._feature.update
+        low = _clamped_int(d.get("v_lo", self.v_lo), CV_MIN, CV_MAX, self.v_lo)
+        high = _clamped_int(d.get("v_hi", self.v_hi), CV_MIN, CV_MAX, self.v_hi)
+        self.v_lo = min(low, high)
+        self.v_hi = max(low, high)
+        for feature in TRACK_FEATURES.values():
+            if feature.project_key is None:
+                continue
+            feature_data = d.get(feature.project_key, {})
+            if isinstance(feature_data, dict):
+                feature.decode_project(self, feature_data, project)
+
+    def from_project_dict(self, d):
+        self._load_dict(d, True)
+        for feature in TRACK_FEATURES.values():
+            feature.reset(self)
 
 
 # ---------------------------------------------------------------------------
-# OutputBus + Sequencer
+# OutputScheduler + Sequencer
 # ---------------------------------------------------------------------------
 
-class OutputBus:
-    """引擎 tick 时接收输出事件的落点：emit 立即事件，emit_after 延时事件。"""
-    __slots__ = ("_seq", "_now", "events")
+class OutputScheduler:
+    """Fixed-size CV state and one replaceable gate deadline per channel."""
+    __slots__ = (
+        "_desired",
+        "_applied",
+        "_pending",
+        "_gate_active",
+        "_gate_low",
+        "_gate_deadline",
+        "late_edges",
+        "last_late_edge_us",
+        "max_late_edge_us",
+    )
 
-    def __init__(self, seq, now_us):
-        self._seq = seq
-        self._now = now_us
-        self.events = []
+    def __init__(self, channel_count=6):
+        self._desired = [0] * channel_count
+        self._applied = [None] * channel_count
+        self._pending = bytearray(channel_count)
+        self._gate_active = bytearray(channel_count)
+        self._gate_low = [0] * channel_count
+        self._gate_deadline = [0] * channel_count
+        self.late_edges = 0
+        self.last_late_edge_us = 0
+        self.max_late_edge_us = 0
 
-    def emit(self, ev):
-        self.events.append(ev)
+    def _queue_voltage(self, channel, voltage):
+        self._desired[channel] = voltage
+        self._pending[channel] = self._applied[channel] != voltage
 
-    def emit_after(self, delay_us, ev):
-        self._seq._scheduled.append((ticks_add(self._now, delay_us), ev))
+    def set_cv(self, channel, voltage):
+        self._queue_voltage(channel, voltage)
+
+    def trigger_gate(self, channel, high, low, length_us, now_us):
+        self._gate_low[channel] = low
+        self._gate_deadline[channel] = ticks_add(now_us, length_us)
+        self._gate_active[channel] = 1
+        self._queue_voltage(channel, high)
+
+    def cancel_channel(self, channel, voltage=0):
+        self._gate_active[channel] = 0
+        self._queue_voltage(channel, voltage)
+
+    def cancel_all(self, voltage=0):
+        channel = 0
+        while channel < len(self._desired):
+            self.cancel_channel(channel, voltage)
+            channel += 1
+
+    def update(self, now_us):
+        changed = False
+        channel = 0
+        while channel < len(self._desired):
+            if self._gate_active[channel]:
+                lateness = ticks_diff(now_us, self._gate_deadline[channel])
+                if lateness >= 0:
+                    self._gate_active[channel] = 0
+                    self._queue_voltage(channel, self._gate_low[channel])
+                    if lateness > 0:
+                        self.late_edges += 1
+                        self.last_late_edge_us = lateness
+                        if lateness > self.max_late_edge_us:
+                            self.max_late_edge_us = lateness
+                    changed = True
+            channel += 1
+        return changed
+
+    def time_to_next_edge_us(self, now_us):
+        """Return the nearest pending gate edge, or None when none is active."""
+        nearest = None
+        channel = 0
+        while channel < len(self._desired):
+            if self._gate_active[channel]:
+                gap = ticks_diff(self._gate_deadline[channel], now_us)
+                if gap < 0:
+                    gap = 0
+                if nearest is None or gap < nearest:
+                    nearest = gap
+            channel += 1
+        return nearest
+
+    def flush(self, write_cv):
+        wrote = False
+        channel = 0
+        while channel < len(self._desired):
+            if self._pending[channel]:
+                voltage = self._desired[channel]
+                write_cv(channel, voltage)
+                self._applied[channel] = voltage
+                self._pending[channel] = 0
+                wrote = True
+            channel += 1
+        return wrote
+
+    def metrics(self):
+        return {
+            "late_edges": self.late_edges,
+            "last_late_edge_us": self.last_late_edge_us,
+            "max_late_edge_us": self.max_late_edge_us,
+        }
 
 
-class Sequencer:
+class TickContext:
+    """Reusable timing snapshot passed through the complete tick path."""
+    __slots__ = (
+        "tick_index",
+        "scheduled_us",
+        "actual_us",
+        "period_us",
+        "transport",
+    )
+
+    def __init__(self, transport):
+        self.tick_index = 0
+        self.scheduled_us = 0
+        self.actual_us = 0
+        self.period_us = 1
+        self.transport = transport
+
+    def write(self, tick_index, scheduled_us, actual_us, period_us):
+        self.tick_index = tick_index
+        self.scheduled_us = scheduled_us
+        self.actual_us = actual_us
+        self.period_us = period_us
+
+
+class SequencerRuntime:
     def __init__(self):
         self.tracks = []
-        self._scheduled = []             # [(due_us, OutputEvent), ...]
+        self.outputs = OutputScheduler(6)
+        self._track_types = [None] * NUM_TRACKS
+        self._global_params = None
 
     def add_track(self, track):
         self.tracks.append(track)
+        self._track_types[track.index] = track.type
 
-    def tick(self, now_us, transport):
-        bus = OutputBus(self, now_us)
+    def sync_track_types(self):
+        for track in self.tracks:
+            if self._track_types[track.index] != track.type:
+                self.outputs.cancel_channel(track.cv_index, 0)
+                self.outputs.cancel_channel(track.gate_index, 0)
+                self._track_types[track.index] = track.type
+
+    def cancel_all(self):
+        self.outputs.cancel_all(0)
+
+    def reset(self):
+        for track in self.tracks:
+            for feature in TRACK_FEATURES.values():
+                feature.reset(track)
+        self.cancel_all()
+
+    def tick(self, context):
+        self.sync_track_types()
         for t in self.tracks:
-            if t.type == "OFF":
-                bus.emit(CVOutputEvent(t.cv_index, 0))
-                bus.emit(CVOutputEvent(t.gate_index, 0))
-                continue
-            if t.type == "EUC":
-                t.engines["EUC"].tick(t.cv_index, t.gate_index, t, bus, now_us, t, transport)
-            else:  # CV：主通道出音高，配对门通道出门脉冲
-                t.engines["CVSEQ"].tick(t.cv_index, t.gate_index, t, bus, now_us, t, transport)
-        return bus.events
+            t._on_tick(t, self.outputs, context)
+
+    def update(self, now_us, context):
+        for track in self.tracks:
+            track._update(track, self.outputs, now_us, context)
 
     def pump(self, now_us):
-        due = []
-        remain = []
-        for due_us, ev in self._scheduled:
-            if ticks_diff(now_us, due_us) >= 0:
-                due.append(ev)
-            else:
-                remain.append((due_us, ev))
-        self._scheduled = remain
-        return due
+        return self.outputs.update(now_us)
+
+    def time_to_next_output_edge_us(self, now_us):
+        return self.outputs.time_to_next_edge_us(now_us)
+
+    def flush_outputs(self, write_cv):
+        return self.outputs.flush(write_cv)
+
+
+# Backwards-compatible public name used by existing imports.
+Sequencer = SequencerRuntime
 
 
 # ---------------------------------------------------------------------------
-# Transport —— 拥有全局音乐时间（无全局电平）
+# ClockService + TransportRuntime —— 调度与音乐播放状态分离
 # ---------------------------------------------------------------------------
 
-class Transport:
+class ClockService:
+    """Absolute-deadline internal clock with bounded catch-up."""
+    __slots__ = (
+        "running",
+        "next_deadline_us",
+        "max_catch_up",
+        "overruns",
+        "dropped_ticks",
+        "last_dropped_ticks",
+        "last_lateness_us",
+        "max_lateness_us",
+    )
+
+    def __init__(self, max_catch_up=MAX_CLOCK_CATCH_UP):
+        self.running = False
+        self.next_deadline_us = 0
+        self.max_catch_up = max_catch_up
+        self.overruns = 0
+        self.dropped_ticks = 0
+        self.last_dropped_ticks = 0
+        self.last_lateness_us = 0
+        self.max_lateness_us = 0
+
+    def start(self, now_us, period_us):
+        self.next_deadline_us = ticks_add(now_us, period_us)
+        self.running = True
+
+    def stop(self):
+        self.running = False
+
+    def update(self, now_us, period_us, on_tick):
+        self.last_dropped_ticks = 0
+        if not self.running or on_tick is None:
+            return 0
+
+        emitted = 0
+        while (
+            ticks_diff(now_us, self.next_deadline_us) >= 0
+            and emitted < self.max_catch_up
+        ):
+            scheduled_us = self.next_deadline_us
+            lateness = ticks_diff(now_us, scheduled_us)
+            self.last_lateness_us = lateness
+            if lateness > self.max_lateness_us:
+                self.max_lateness_us = lateness
+            self.next_deadline_us = ticks_add(self.next_deadline_us, period_us)
+            on_tick(scheduled_us, now_us, period_us)
+            emitted += 1
+            if not self.running:
+                return emitted
+
+        if ticks_diff(now_us, self.next_deadline_us) >= 0:
+            missed = ticks_diff(now_us, self.next_deadline_us) // period_us + 1
+            self.next_deadline_us = ticks_add(
+                self.next_deadline_us, missed * period_us
+            )
+            self.overruns += 1
+            self.dropped_ticks += missed
+            self.last_dropped_ticks = missed
+        return emitted
+
+    def metrics(self):
+        return {
+            "overruns": self.overruns,
+            "dropped_ticks": self.dropped_ticks,
+            "last_lateness_us": self.last_lateness_us,
+            "max_lateness_us": self.max_lateness_us,
+        }
+
+
+class TransportRuntime:
     def __init__(self, on_tick):
         self._on_tick = on_tick
+        self._on_stop = None
+        self._on_reset = None
+        self.clock = ClockService()
+        self._clock_tick = self._emit_internal_base_tick
         self.bpm = 120
         self.mul = 4
         self.source = "INT"
-        self.running = False
         self.beat_index = 0
-        self.next_clock_us = 0
+        self.base_tick_index = 0
+        self.internal_phase = 0
+        self.dropped_music_steps = 0
+        self.tick_context = TickContext(self)
+        self.external_ticks = 0
+        self.last_external_us = 0
+        self.last_external_interval_us = 0
+        self.external_jitter_us = 0
+        self.max_external_jitter_us = 0
+        self.external_timeouts = 0
+        self.external_timed_out = False
+
+    @property
+    def running(self):
+        return self.clock.running
+
+    @running.setter
+    def running(self, running):
+        self.clock.running = running
+
+    @property
+    def next_clock_us(self):
+        return self.clock.next_deadline_us
+
+    @next_clock_us.setter
+    def next_clock_us(self, deadline_us):
+        self.clock.next_deadline_us = deadline_us
+
+    @property
+    def max_catch_up(self):
+        return self.clock.max_catch_up
+
+    @max_catch_up.setter
+    def max_catch_up(self, count):
+        self.clock.max_catch_up = count
+
+    @property
+    def overruns(self):
+        return self.clock.overruns
+
+    @property
+    def dropped_ticks(self):
+        return self.clock.dropped_ticks
+
+    @property
+    def last_lateness_us(self):
+        return self.clock.last_lateness_us
+
+    @property
+    def max_lateness_us(self):
+        return self.clock.max_lateness_us
 
     def set_on_tick(self, cb):
         self._on_tick = cb
+
+    def set_runtime_callbacks(self, on_stop=None, on_reset=None):
+        self._on_stop = on_stop
+        self._on_reset = on_reset
 
     def beat_us(self):
         eff = self.bpm * self.mul
         return max(1, 60_000_000 // eff)
 
+    def base_tick_us(self):
+        return max(1, 60_000_000 // (self.bpm * INTERNAL_PPQN))
+
+    def _reset_internal_phase(self):
+        self.internal_phase = 0
+
+    def _next_music_step_ticks(self):
+        remaining = INTERNAL_PPQN - self.internal_phase
+        return (remaining + self.mul - 1) // self.mul
+
     def start(self):
-        self.next_clock_us = ticks_add(ticks_us(), self.beat_us())
+        if self._on_reset is not None:
+            self._on_reset()
+        self._reset_internal_phase()
+        self.base_tick_index = 0
+        self.clock.start(ticks_us(), self.base_tick_us())
         self.beat_index = 0
-        self.running = True
+
+    def continue_(self):
+        if self.source != "INT" or self.running:
+            return
+        self._reset_internal_phase()
+        self.clock.start(ticks_us(), self.base_tick_us())
 
     def stop(self):
-        self.running = False
+        self.clock.stop()
+        if self._on_stop is not None:
+            self._on_stop()
+
+    def reset(self):
+        self.beat_index = 0
+        self.base_tick_index = 0
+        self._reset_internal_phase()
+        if self._on_reset is not None:
+            self._on_reset()
+        if self.source == "INT" and self.running:
+            self.clock.start(ticks_us(), self.base_tick_us())
 
     def toggle_internal_clock(self):
         if self.source != "INT":
@@ -1046,22 +1760,88 @@ class Transport:
             self.start()
 
     def update(self, now_us):
-        if self.source != "INT" or not self.running or self._on_tick is None:
+        if self.source == "EXT":
+            self._check_external_timeout(now_us)
+            return 0
+        if not self.running:
+            return 0
+        beat_index = self.beat_index
+        self.clock.update(now_us, self.base_tick_us(), self._clock_tick)
+        if self.clock.last_dropped_ticks:
+            self._advance_dropped_base_ticks(self.clock.last_dropped_ticks)
+        return self.beat_index - beat_index
+
+    def _advance_dropped_base_ticks(self, count):
+        phase = self.internal_phase + count * self.mul
+        self.dropped_music_steps += phase // INTERNAL_PPQN
+        self.internal_phase = phase % INTERNAL_PPQN
+
+    def _emit_internal_base_tick(self, scheduled_us, actual_us, period_us):
+        self.base_tick_index += 1
+        self.internal_phase += self.mul
+        if self.internal_phase < INTERNAL_PPQN:
             return
-        if ticks_diff(now_us, self.next_clock_us) >= 0:
-            self._on_tick()
-            self.beat_index += 1
-            self.next_clock_us = ticks_add(now_us, self.beat_us())
+        self.internal_phase -= INTERNAL_PPQN
+        if self._on_tick is None:
+            return
+        step_period_us = self._next_music_step_ticks() * period_us
+        self.tick_context.write(
+            self.beat_index, scheduled_us, actual_us, step_period_us
+        )
+        self._on_tick(self.tick_context)
+        self.beat_index += 1
 
     def time_to_next_clock_us(self, now_us):
         if self.source != "INT" or not self.running:
             return None
-        return ticks_diff(self.next_clock_us, now_us)
+        return ticks_diff(self.clock.next_deadline_us, now_us)
+
+    def time_to_next_step_us(self, now_us):
+        if self.source != "INT" or not self.running:
+            return None
+        step_deadline_us = ticks_add(
+            self.clock.next_deadline_us,
+            (self._next_music_step_ticks() - 1) * self.base_tick_us(),
+        )
+        return ticks_diff(step_deadline_us, now_us)
 
     def ext_tick(self, t=None):
         if self.source == "EXT" and self._on_tick is not None:
-            self._on_tick()
+            if t is None:
+                t = ticks_us()
+            interval_us = 0
+            if self.external_ticks and not self.external_timed_out:
+                interval_us = ticks_diff(t, self.last_external_us)
+                if self.last_external_interval_us:
+                    jitter_us = abs(interval_us - self.last_external_interval_us)
+                    self.external_jitter_us = jitter_us
+                    if jitter_us > self.max_external_jitter_us:
+                        self.max_external_jitter_us = jitter_us
+                self.last_external_interval_us = interval_us
+            elif self.external_timed_out:
+                self.last_external_interval_us = 0
+                self.external_jitter_us = 0
+                self.external_timed_out = False
+            self.last_external_us = t
+            self.external_ticks += 1
+            actual_us = ticks_us()
+            period_us = interval_us if interval_us > 0 else self.beat_us()
+            self.tick_context.write(self.beat_index, t, actual_us, period_us)
+            self._on_tick(self.tick_context)
             self.beat_index += 1
+
+    def _check_external_timeout(self, now_us):
+        if (
+            self.source == "EXT"
+            and not self.external_timed_out
+            and self.last_external_interval_us > 0
+            and ticks_diff(now_us, self.last_external_us)
+            >= self.last_external_interval_us * EXTERNAL_TIMEOUT_PERIODS
+        ):
+            self.external_timed_out = True
+            self.external_timeouts += 1
+            return True
+        return False
 
     def set_source(self, src):
         if src == self.source:
@@ -1078,7 +1858,8 @@ class Transport:
             return
         self.bpm = bpm
         if self.source == "INT" and self.running:
-            self.start()
+            self._reset_internal_phase()
+            self.clock.start(ticks_us(), self.base_tick_us())
 
     def set_mul(self, mul):
         mul = min(max(mul, MIN_MUL), MAX_MUL)
@@ -1086,29 +1867,164 @@ class Transport:
             return
         self.mul = mul
         if self.source == "INT" and self.running:
-            self.start()
+            self._reset_internal_phase()
+            self.clock.start(ticks_us(), self.base_tick_us())
 
     def to_dict(self):
         return {"source": self.source, "bpm": self.bpm, "mul": self.mul}
 
+    def metrics(self):
+        metrics = self.clock.metrics()
+        metrics.update({
+            "internal_ppqn": INTERNAL_PPQN,
+            "internal_base_ticks": self.base_tick_index,
+            "internal_phase": self.internal_phase,
+            "dropped_music_steps": self.dropped_music_steps,
+            "external_ticks": self.external_ticks,
+            "external_interval_us": self.last_external_interval_us,
+            "external_jitter_us": self.external_jitter_us,
+            "max_external_jitter_us": self.max_external_jitter_us,
+            "external_timeouts": self.external_timeouts,
+        })
+        return metrics
+
     def from_dict(self, d):
-        if not d:
+        if not isinstance(d, dict) or not d:
             return
-        self.source = d.get("source", self.source)
-        self.bpm = d.get("bpm", self.bpm)
-        self.mul = d.get("mul", self.mul)
+        source = d.get("source", self.source)
+        if source in ("INT", "EXT"):
+            self.source = source
+        self.bpm = _clamped_int(d.get("bpm", self.bpm), MIN_BPM, MAX_BPM, self.bpm)
+        self.mul = _clamped_int(d.get("mul", self.mul), MIN_MUL, MAX_MUL, self.mul)
+        self.base_tick_index = 0
+        self._reset_internal_phase()
+
+
+# Backwards-compatible public name used by existing scripts and tests.
+Transport = TransportRuntime
+
+
+class RuntimeState:
+    """Non-persistent runtime aggregate for transport, players and outputs."""
+    __slots__ = ("transport", "sequencer")
+
+    def __init__(self, transport, sequencer):
+        self.transport = transport
+        self.sequencer = sequencer
+
+    def reset_after_load(self):
+        self.transport.stop()
+        self.transport.beat_index = 0
+        self.transport.base_tick_index = 0
+        self.transport._reset_internal_phase()
+        self.sequencer.reset()
+        self.sequencer.sync_track_types()
+
+
+class ProjectState:
+    """Versioned, validated project data; runtime positions are excluded."""
+    __slots__ = ("clock", "tracks", "source_version", "load_errors")
+
+    def __init__(self, clock, tracks, source_version=STATE_SCHEMA_VERSION):
+        self.clock = clock
+        self.tracks = tracks
+        self.source_version = source_version
+        self.load_errors = 0
+
+    @classmethod
+    def capture(cls, transport, tracks):
+        return cls(
+            transport.to_dict(),
+            [track.to_project_dict() for track in tracks],
+        )
+
+    @classmethod
+    def decode(cls, state):
+        if not isinstance(state, dict):
+            return None
+        version = state.get("schema_version", 1)
+        if version not in (1, STATE_SCHEMA_VERSION):
+            return None
+        clock = state.get("clock", {})
+        tracks = state.get("tracks", [])
+        if not isinstance(clock, dict):
+            clock = {}
+        if not isinstance(tracks, list):
+            tracks = []
+        return cls(clock, tracks, version)
+
+    def apply(self, transport, sequencer):
+        transport.from_dict(self.clock)
+        index = 0
+        while index < len(sequencer.tracks) and index < len(self.tracks):
+            track_data = self.tracks[index]
+            if isinstance(track_data, dict):
+                track_type = track_data.get("type")
+                if track_type is not None and track_type not in TYPE_NAMES:
+                    self.load_errors += 1
+                try:
+                    sequencer.tracks[index].from_project_dict(track_data)
+                except (TypeError, ValueError, KeyError, IndexError):
+                    self.load_errors += 1
+            else:
+                self.load_errors += 1
+            index += 1
+        RuntimeState(transport, sequencer).reset_after_load()
+
+    def to_dict(self):
+        return {
+            "schema_version": STATE_SCHEMA_VERSION,
+            "clock": self.clock,
+            "tracks": self.tracks,
+        }
+
+
+class PersistenceService:
+    """Separates project serialization from the EuroPiScript storage API."""
+    __slots__ = ("_storage", "_pending")
+
+    def __init__(self, storage):
+        self._storage = storage
+        self._pending = None
+
+    def load(self):
+        return ProjectState.decode(self._storage.load_state_json())
+
+    def save(self, project):
+        self._storage.save_state_json(project.to_dict())
+        return True
+
+    def request(self, project):
+        self._pending = project
+        return "pending"
+
+    @property
+    def pending(self):
+        return self._pending is not None
+
+    def flush(self):
+        if self._pending is None:
+            return None
+        project = self._pending
+        self._pending = None
+        try:
+            return self.save(project)
+        except Exception as error:
+            print("Seq2: failed to save state:", error)
+            return False
 
 
 # ---------------------------------------------------------------------------
 # Application State —— 仅 UI 状态
 # ---------------------------------------------------------------------------
 
-class AppState:
+class UiState:
     def __init__(self):
         self.page = 0
         self.sel = 0
         self.k2_picked = False
         self.dirty = True
+        self.redraw_all = True
         self.notice = None
         self.notice_until_ms = 0
 
@@ -1116,17 +2032,20 @@ class AppState:
         self.notice = text
         self.notice_until_ms = ticks_add(ticks_ms(), duration_ms)
         self.dirty = True
+        self.redraw_all = True
 
     def expire_notice(self, now_ms):
         if self.notice is not None and ticks_diff(now_ms, self.notice_until_ms) >= 0:
             self.notice = None
             self.dirty = True
+            self.redraw_all = True
 
     def _set_page(self, p):
         self.page = p
         self.sel = 0
         self.k2_picked = False
         self.dirty = True
+        self.redraw_all = True
 
     def prev_page(self):
         self._set_page((self.page - 1) % NUM_PAGES)
@@ -1138,111 +2057,132 @@ class AppState:
         self._set_page(0)
 
 
+# Backwards-compatible public name while callers migrate to UiState.
+AppState = UiState
+
+
 # ---------------------------------------------------------------------------
-# Renderer —— 无状态渲染
+# ViewSnapshot + Renderer —— 快照写入与无模型渲染
 # ---------------------------------------------------------------------------
 
-class Renderer:
-    def render(self, app, seq, transport, hw):
-        hw.display_clear()
+class ViewSnapshot:
+    __slots__ = (
+        "page_label",
+        "header_value",
+        "notice",
+        "feature",
+        "sequence_a",
+        "sequence_b",
+        "playhead",
+        "last_output",
+        "cv_values",
+        "cv_length",
+        "cv_position",
+        "selected_step",
+        "redraw_all",
+        "_header_slot",
+        "_header_value",
+    )
+
+    def __init__(self):
+        self.page_label = PAGE_LABELS[0]
+        self.header_value = ""
+        self.notice = None
+        self.feature = None
+        self.sequence_a = bytearray(16)
+        self.sequence_b = bytearray(16)
+        self.playhead = 0
+        self.last_output = False
+        self.cv_values = bytearray(CV_LEN)
+        self.cv_length = 0
+        self.cv_position = -1
+        self.selected_step = -1
+        self.redraw_all = True
+        self._header_slot = None
+        self._header_value = None
+
+    def write(self, app, sequencer, transport):
+        self.redraw_all = app.redraw_all
+        self.page_label = PAGE_LABELS[app.page]
+        self.notice = app.notice
         if app.page == 0:
-            self._draw_global(app, seq, transport, hw)
+            slot = build_global_params(sequencer, transport, app)[app.sel]
+            value = slot.get_cur(transport)
+            if slot is not self._header_slot or value != self._header_value:
+                self.header_value = "%s:%s" % (slot.abbr, slot.fmt(transport))
+                self._header_slot = slot
+                self._header_value = value
+            self.feature = None
+            return
+
+        track = sequencer.tracks[app.page - 1]
+        self.feature = track.feature
+        slots = self.feature.slots(track)
+        if slots:
+            slot = slots[app.sel]
+            value = slot.get_cur(track)
+            if slot is not self._header_slot or value != self._header_value:
+                self.header_value = "%s:%s" % (slot.abbr, slot.fmt(track))
+                self._header_slot = slot
+                self._header_value = value
         else:
-            self._draw_channel(app, seq, transport, hw)
-        if app.notice is not None:
-            self._draw_notice(app.notice, hw)
+            self.header_value = "OFF"
+            self._header_slot = None
+            self._header_value = None
+        self.feature.write_snapshot(track, app, transport, self)
+
+
+class Renderer:
+    def draw(self, snapshot, hw):
+        if not snapshot.redraw_all:
+            if snapshot.feature is not None:
+                snapshot.feature.render_dynamic(snapshot, hw)
+            return
+        hw.display_clear()
+        hw.display_text(
+            snapshot.page_label,
+            OLED_WIDTH - len(snapshot.page_label) * 8,
+            0,
+        )
+        hw.display_text(snapshot.header_value, 0, 0)
+        if snapshot.feature is not None:
+            snapshot.feature.render(snapshot, hw)
+        if snapshot.notice is not None:
+            self._draw_notice(snapshot.notice, hw)
+
+    def show_page(self, page, hw):
+        hw.display_show_page(page)
+
+    def render(self, snapshot, hw):
+        """Draw and submit a full frame for compatibility outside Controller."""
+        self.draw(snapshot, hw)
         hw.display_show()
 
     def _draw_notice(self, text, hw):
         hw.display_fill_rect(0, 0, OLED_WIDTH, CHAR_HEIGHT, 0)
         hw.display_text(text, 0, 0)
 
-    def _status(self, app, seq, transport):
-        if app.page == 0:
-            slot = build_global_params(seq, transport, None)[app.sel]
-            return f"P{app.page}", f"{slot.abbr}:{slot.fmt(transport)}"
-        track = seq.tracks[app.page - 1]
-        slot = track.engine.slots(track)[app.sel]
-        return f"P{app.page}", f"{slot.abbr}:{slot.fmt(track)}"
-
-    def _draw_global(self, app, seq, transport, hw):
-        page_str, val_str = self._status(app, seq, transport)
-        hw.display_text(page_str, OLED_WIDTH - len(page_str) * 8, 0)
-        hw.display_text(val_str, 0, 0)
-
-    def _draw_channel(self, app, seq, transport, hw):
-        page_str, val_str = self._status(app, seq, transport)
-        hw.display_text(page_str, OLED_WIDTH - len(page_str) * 8, 0)
-        hw.display_text(val_str, 0, 0)
-        track = seq.tracks[app.page - 1]
-        if track.type == "OFF":
-            hw.display_text("OFF", 52, 12)
-            return
-        if track.type == "EUC":
-            self._draw_euclid(track, transport, hw)
-        else:
-            self._draw_cv(track, app, hw)
-
-    def _draw_euclid(self, track, transport, hw):
-        eng = track.engine
-        bi = transport.beat_index
-        cur = bi - 1 if bi > 0 else 0
-        wstart = (cur // 16) * 16
-        self._draw_seq_row(eng.g1, 8, wstart, hw)
-        self._draw_seq_row(eng.g2, 16, wstart, hw)
-        self._draw_playhead(track, cur % 16, 26, hw)
-
-    def _draw_cv(self, track, app, hw):
-        eng = track.engine
-        for c in range(CV_LEN):
-            if c < eng.length:
-                h = round(eng.values[c] / CV_VAL_MAX * 16)
-                if h > 0:
-                    hw.display_fill_rect(c * 8, 25 - h, 6, h, 1)
-            else:
-                hw.display_fill_rect(c * 8 + 2, 25, 2, 1, 1)
-        # 选中步槽：底部播放头行画一条横线（宽 6，与步条一致）作为编辑指示
-        npar = len(eng.param_defs(track))
-        step_sel = app.sel - npar
-        if 0 <= step_sel < eng.length:
-            hw.display_fill_rect(step_sel * 8, 29, 6, 1, 1)
-        # 唱头（播放实时位置），与编辑头可同时显示
-        if 0 <= eng.pos < CV_LEN:
-            hw.display_fill_rect(eng.pos * 8, 27, 6, 3, 1)
-
-    def _draw_seq_row(self, gen, y, wstart, hw):
-        for c in range(16):
-            idx = (wstart + c) % gen.steps
-            if gen.pattern[idx]:
-                hw.display_fill_rect(c * 8, y, 6, 6, 1)
-            else:
-                hw.display_fill_rect(c * 8 + 2, y + 2, 2, 2, 1)
-
-    def _draw_playhead(self, track, play_pos, y, hw):
-        if track.engine.last_out:
-            hw.display_fill_rect(play_pos * 8, y, 6, 6, 1)
-        else:
-            hw.display_fill_rect(play_pos * 8 + 2, y + 2, 2, 2, 1)
-
 
 # ---------------------------------------------------------------------------
-# UI Pages —— 把交互译为命令（槽位模型，表驱动）
+# UI Pages —— 把交互译为 descriptor 编辑（槽位模型，表驱动）
 # ---------------------------------------------------------------------------
 
 def build_global_params(seq, transport, app):
-    """P0 全局参数：CLK / BPM / MUL / T1..T6 / R1..R6。"""
+    """P0 全局参数：CLK / BPM / MUL / T1..T3。"""
+    if seq._global_params is not None:
+        return seq._global_params
     params = [
         Param("CLK", 0, 1, True,
               lambda t: 0 if t.source == "INT" else 1,
-              lambda t, v: SetTransportSource(t, "EXT" if v else "INT"),
+              lambda t, v: t.set_source("EXT" if v else "INT"),
               lambda t: t.source),
         Param("BPM", MIN_BPM, MAX_BPM, False,
               lambda t: t.bpm,
-              lambda t, v: SetBpm(t, v),
+              lambda t, v: t.set_bpm(v),
               lambda t: t.bpm),
         Param("MUL", MIN_MUL, MAX_MUL, False,
               lambda t: t.mul,
-              lambda t, v: SetMul(t, v),
+              lambda t, v: t.set_mul(v),
               lambda t: t.mul),
     ]
     for i in range(NUM_TRACKS):
@@ -1250,10 +2190,11 @@ def build_global_params(seq, transport, app):
         params.append(
             Param(f"T{i + 1}", 0, len(TYPE_NAMES) - 1, True,
                   lambda tr, tid=tid: TYPE_NAMES.index(seq.tracks[tid].type),
-                  lambda tr, v, tid=tid: SetTrackType(seq.tracks[tid], TYPE_NAMES[v], app),
+                  lambda tr, v, tid=tid: seq.tracks[tid].set_type(TYPE_NAMES[v]),
                   lambda tr, tid=tid: seq.tracks[tid].type)
         )
-    return params
+    seq._global_params = params
+    return seq._global_params
 
 
 class Pages:
@@ -1262,6 +2203,7 @@ class Pages:
         self.transport = transport
         self.seq = seq
         self._exec = exec_cmd
+        build_global_params(seq, transport, app)
 
     def set_exec(self, exec_cmd):
         self._exec = exec_cmd
@@ -1270,10 +2212,12 @@ class Pages:
         if self.app.page == 0:
             return len(build_global_params(self.seq, self.transport, self.app))
         track = self.seq.tracks[self.app.page - 1]
-        return len(track.engine.slots(track))
+        return track.feature.slot_count(track)
 
     def on_knob1(self, p):
         n = self._slot_count()
+        if n == 0:
+            return
         idx = int(p * n)
         if idx >= n:
             idx = n - 1
@@ -1281,6 +2225,7 @@ class Pages:
             self.app.sel = idx
             self.app.k2_picked = False
             self.app.dirty = True
+            self.app.redraw_all = True
 
     def on_knob2(self, p):
         if self.app.page == 0:
@@ -1289,37 +2234,99 @@ class Pages:
         else:
             track = self.seq.tracks[self.app.page - 1]
             ctx = track
-            slots = track.engine.slots(track)
+            slots = track.feature.slots(track)
+        if not slots:
+            return
         slots[self.app.sel].edit(ctx, p, self._exec, self.app)
 
 
 # ---------------------------------------------------------------------------
-# Controller
+# EditorService + Controller
 # ---------------------------------------------------------------------------
 
+class EditorService:
+    """Applies descriptor edits and centralizes runtime side effects."""
+    __slots__ = (
+        "app",
+        "transport",
+        "sequencer",
+        "_on_changed",
+        "_flush_outputs",
+    )
+
+    def __init__(self, app, transport, sequencer, on_changed, flush_outputs):
+        self.app = app
+        self.transport = transport
+        self.sequencer = sequencer
+        self._on_changed = on_changed
+        self._flush_outputs = flush_outputs
+
+    def set(self, slot, ctx, value):
+        was_running = self.transport.running
+        slot.set_value(ctx, value)
+        if slot.abbr.startswith("T"):
+            self.app.k2_picked = False
+        if self.sequencer is not None:
+            self.sequencer.sync_track_types()
+            if was_running and not self.transport.running:
+                self.sequencer.cancel_all()
+        self._flush_outputs()
+        self._on_changed()
+
+
 class Controller:
-    def __init__(self, hw, app, transport, seq, input_mgr, renderer, pages, on_save=None):
+    def __init__(
+        self,
+        hw,
+        app,
+        transport,
+        seq,
+        input_mgr,
+        renderer,
+        pages,
+        on_save=None,
+        on_save_flush=None,
+    ):
         self.hw = hw
+        self._write_cv = hw.set_cv if hw is not None else None
         self.app = app
         self.transport = transport
         self.seq = seq
         self.input = input_mgr
         self.renderer = renderer
+        self.snapshot = ViewSnapshot() if renderer is not None else None
         self.pages = pages
         self._on_save = on_save
+        self._on_save_flush = on_save_flush
+        self._save_pending = False
+        self._display_page = -1
+        self.editor = EditorService(
+            app,
+            transport,
+            seq,
+            self.on_changed,
+            self._flush_outputs,
+        )
 
-    def _on_beat(self):
+    def _on_beat(self, context=None):
+        if context is None:
+            now_us = ticks_us()
+            context = self.transport.tick_context
+            context.write(
+                self.transport.beat_index,
+                now_us,
+                now_us,
+                self.transport.beat_us(),
+            )
         with PROFILER.section("on_beat"):
-            events = self.seq.tick(ticks_us(), self.transport)
-            self._apply_outputs(events)
-        self.app.dirty = True
+            self.seq.tick(context)
+            self._flush_outputs()
+        if self.app.page != 0:
+            self.app.dirty = True
 
-    def _apply_outputs(self, events):
-        for ev in events:
-            if isinstance(ev, CVOutputEvent):
-                self.hw.set_cv(ev.channel, ev.voltage)
-            elif isinstance(ev, ClockOutputEvent):
-                pass
+    def _flush_outputs(self):
+        if self._write_cv is not None and self.seq is not None:
+            self.seq.flush_outputs(self._write_cv)
 
     def dispatch(self, ev):
         if isinstance(ev, KnobTurn):
@@ -1330,26 +2337,115 @@ class Controller:
         elif isinstance(ev, ButtonEvent):
             if ev.button == "B1":
                 if ev.kind == "long":
-                    self._exec(ToggleInternalClock(self.transport))
+                    was_running = self.transport.running
+                    self.transport.toggle_internal_clock()
+                    self._after_model_change(was_running)
                 else:
                     self.app.prev_page()
             else:
                 if ev.kind == "long":
                     if self._on_save:
                         saved = self._on_save()
-                        if saved is not False:
+                        if saved == "pending":
+                            self._save_pending = True
+                            self.app.show_notice(SAVE_PENDING_TEXT, SAVE_NOTICE_MS)
+                        elif saved is not False:
                             self.app.show_notice(SAVE_NOTICE_TEXT, SAVE_NOTICE_MS)
                 else:
                     self.app.next_page()
         elif isinstance(ev, ClockEvent):
-            self.transport.ext_tick()
+            self.transport.ext_tick(ev.timestamp_us)
 
-    def _exec(self, cmd):
-        cmd.execute()
+    def _after_model_change(self, was_running):
+        if self.seq is not None:
+            self.seq.sync_track_types()
+            if was_running and not self.transport.running:
+                self.seq.cancel_all()
+        self._flush_outputs()
         self.on_changed()
 
     def on_changed(self):
         self.app.dirty = True
+        self.app.redraw_all = True
+
+    def _flush_pending_save(self, now_us):
+        if not self._save_pending or self._on_save_flush is None:
+            return
+        gap = self.transport.time_to_next_step_us(now_us)
+        if gap is not None and gap < SAVE_GUARD_US:
+            return
+        saved = self._on_save_flush()
+        if saved is None:
+            return
+        self._save_pending = False
+        notice = SAVE_NOTICE_TEXT if saved else SAVE_FAILED_TEXT
+        self.app.show_notice(notice, SAVE_NOTICE_MS)
+
+    def _prepare_display(self, now_us=None):
+        if (
+            self._display_page >= 0
+            or not self.app.dirty
+            or self.renderer is None
+            or self.hw is None
+        ):
+            return False
+        if now_us is None:
+            now_us = ticks_us()
+        if self.seq is not None and self.seq.pump(now_us):
+            self._flush_outputs()
+        if self.app.redraw_all and self.seq is not None:
+            output_slack = self.seq.time_to_next_output_edge_us(now_us)
+            if (
+                output_slack is not None
+                and output_slack <= OLED_FULL_RENDER_GUARD_US
+            ):
+                return False
+        slack = self._display_slack_us(now_us)
+        if slack is not None and slack <= OLED_PAGE_GUARD_US:
+            return False
+        self.snapshot.write(self.app, self.seq, self.transport)
+        self.renderer.draw(self.snapshot, self.hw)
+        self._display_page = 0
+        self.app.dirty = False
+        self.app.redraw_all = False
+        return True
+
+    def _display_slack_us(self, now_us):
+        slack = None
+        if self.transport.source == "INT":
+            slack = self.transport.time_to_next_clock_us(now_us)
+            if slack is not None and slack < 0:
+                slack = 0
+        if self.seq is not None:
+            output_slack = self.seq.time_to_next_output_edge_us(now_us)
+            if output_slack is not None and (
+                slack is None or output_slack < slack
+            ):
+                slack = output_slack
+        return slack
+
+    def _flush_display_page(self, now_us=None):
+        if self._display_page < 0:
+            return False
+        if now_us is None:
+            now_us = ticks_us()
+        if self.seq is not None and self.seq.pump(now_us):
+            self._flush_outputs()
+        slack = self._display_slack_us(now_us)
+        if slack is not None and slack <= OLED_PAGE_GUARD_US:
+            return False
+
+        self.renderer.show_page(self._display_page, self.hw)
+        self._display_page += 1
+        if self._display_page == OLED_PAGE_COUNT:
+            self._display_page = -1
+
+        # Service internal deadlines immediately after the blocking I2C page.
+        completed_us = ticks_us()
+        self.transport.update(completed_us)
+        if self.seq is not None and self.seq.pump(completed_us):
+            self._flush_outputs()
+        return True
 
     def main(self):
         while True:
@@ -1357,20 +2453,20 @@ class Controller:
             with PROFILER.section("loop"):
                 self.app.expire_notice(ticks_ms())
                 self.transport.update(now_us)
-                due = self.seq.pump(now_us)
-                if due:
-                    self._apply_outputs(due)
+                self.seq.update(now_us, self.transport.tick_context)
+                if self.seq.pump(now_us):
+                    self._flush_outputs()
                 with PROFILER.section("poll"):
                     events = self.input.poll()
                 for ev in events:
                     with PROFILER.section("dispatch"):
                         self.dispatch(ev)
-                if self.app.dirty:
-                    gap = self.transport.time_to_next_clock_us(now_us)
-                    if gap is None or gap >= T_SHOW_US:
-                        with PROFILER.section("render"):
-                            self.renderer.render(self.app, self.seq, self.transport, self.hw)
-                        self.app.dirty = False
+                self._flush_pending_save(now_us)
+                if self._display_page < 0 and self.app.dirty:
+                    with PROFILER.section("render"):
+                        self._prepare_display()
+                with PROFILER.section("display"):
+                    self._flush_display_page()
             time.sleep_ms(0)
             PROFILER.maybe_print(now_us)
 
@@ -1388,7 +2484,7 @@ class Seq2(EuroPiScript):
         super().__init__()
 
         hw = Hardware()
-        app = AppState()
+        app = UiState()
         transport = Transport(None)
         seq = Sequencer()
 
@@ -1402,12 +2498,24 @@ class Seq2(EuroPiScript):
         renderer = Renderer()
         pages = Pages(app, transport, seq, None)
 
+        self.persistence = PersistenceService(self)
         controller = Controller(
-            hw, app, transport, seq, input_mgr, renderer, pages,
-            on_save=self.save_state,
+            hw,
+            app,
+            transport,
+            seq,
+            input_mgr,
+            renderer,
+            pages,
+            on_save=self.request_save,
+            on_save_flush=self.flush_save,
         )
-        pages.set_exec(controller._exec)
+        pages.set_exec(controller.editor.set)
         transport.set_on_tick(controller._on_beat)
+        transport.set_runtime_callbacks(
+            on_stop=seq.cancel_all,
+            on_reset=seq.reset,
+        )
 
         self.hw = hw
         self.app = app
@@ -1427,30 +2535,34 @@ class Seq2(EuroPiScript):
 
     # —— 状态持久化 ——
     def get_state(self):
-        return {
-            "clock": self.transport.to_dict(),
-            "tracks": [t.to_dict() for t in self.seq.tracks],
-        }
+        return ProjectState.capture(self.transport, self.seq.tracks).to_dict()
 
     def set_state(self, state):
-        try:
-            self.transport.from_dict(state.get("clock", {}))
-            tracks = state.get("tracks") or []
-            for track, d in zip(self.seq.tracks, tracks):
-                track.from_dict(d)
-        except Exception as e:
-            print("Seq2: failed to load state:", e)
+        project = ProjectState.decode(state)
+        if project is None:
+            return False
+        project.apply(self.transport, self.seq)
+        return True
 
     def load_state(self):
-        state = self.load_state_json()
-        if state:
-            self.set_state(state)
+        project = self.persistence.load()
+        if project is not None:
+            project.apply(self.transport, self.seq)
 
     def save_state(self):
         if not SAVE_STATES:
             return False
-        self.save_state_json(self.get_state())
-        return True
+        project = ProjectState.capture(self.transport, self.seq.tracks)
+        return self.persistence.save(project)
+
+    def request_save(self):
+        if not SAVE_STATES:
+            return False
+        project = ProjectState.capture(self.transport, self.seq.tracks)
+        return self.persistence.request(project)
+
+    def flush_save(self):
+        return self.persistence.flush()
 
 
 if __name__ == "__main__":

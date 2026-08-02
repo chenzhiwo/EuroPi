@@ -57,8 +57,32 @@ class Display(SSD1306_I2C):
         self.width = width
         self.height = height
         super().__init__(self.width, self.height, i2c)
+        buffer_view = memoryview(self.buffer)
+        self._page_views = tuple(
+            buffer_view[page * self.width : (page + 1) * self.width]
+            for page in range(self.pages)
+        )
         self.rotate(rotate)
         self.contrast(contrast)
+
+    def show_page(self, page):
+        """Transfer one 8-pixel-high framebuffer page without allocating."""
+        if page < 0 or page >= self.pages:
+            raise ValueError("Display page out of range")
+
+        x0 = 0
+        x1 = self.width - 1
+        if self.width != 128:
+            column_offset = (128 - self.width) // 2
+            x0 += column_offset
+            x1 += column_offset
+        self.write_cmd(ssd1306.SET_COL_ADDR)
+        self.write_cmd(x0)
+        self.write_cmd(x1)
+        self.write_cmd(ssd1306.SET_PAGE_ADDR)
+        self.write_cmd(page)
+        self.write_cmd(page)
+        self.write_data(self._page_views[page])
 
     def rotate(self, rotate):
         """Flip the screen from its default orientation
@@ -118,6 +142,9 @@ class DummyDisplay:
         pass
 
     def show(self):
+        pass
+
+    def show_page(self, page):
         pass
 
     def fill(self, color):
