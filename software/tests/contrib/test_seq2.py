@@ -1526,6 +1526,118 @@ def test_input_manager_drains_bounded_clock_capture_with_timestamps():
     assert [id(event) for event in reused_events] == event_ids
 
 
+def test_input_manager_tracks_motion_then_suppresses_static_knob_jitter(monkeypatch):
+    now_ms = [1_000]
+    monkeypatch.setattr(seq2, "ticks_ms", lambda: now_ms[0])
+    use_linear_ticks(monkeypatch)
+
+    class InputHardware:
+        k1_value = 0.5
+        k2_value = 0.5
+
+        def button1(self):
+            return False
+
+        def button2(self):
+            return False
+
+        def knob1(self):
+            return self.k1_value
+
+        def knob2(self):
+            return self.k2_value
+
+        def pop_clock_timestamp(self):
+            return None
+
+    hardware = InputHardware()
+    manager = InputManager(hardware)
+
+    assert len([event for event in manager.poll() if isinstance(event, seq2.KnobTurn)]) == 2
+
+    hardware.k1_value = 0.505
+    hardware.k2_value = 0.505
+    assert not [event for event in manager.poll() if isinstance(event, seq2.KnobTurn)]
+
+    hardware.k1_value = 0.515
+    hardware.k2_value = 0.515
+    assert len([event for event in manager.poll() if isinstance(event, seq2.KnobTurn)]) == 2
+
+    now_ms[0] += 50
+    hardware.k1_value = 0.519
+    hardware.k2_value = 0.519
+    moving = [event for event in manager.poll() if isinstance(event, seq2.KnobTurn)]
+    assert [event.value for event in moving] == [0.519, 0.519]
+
+    now_ms[0] += seq2.KNOB_ACTIVE_TIMEOUT_MS + 1
+    hardware.k1_value = 0.523
+    hardware.k2_value = 0.523
+    assert not [event for event in manager.poll() if isinstance(event, seq2.KnobTurn)]
+
+
+def test_input_manager_reaches_both_knob_endpoints_while_active(monkeypatch):
+    now_ms = [1_000]
+    monkeypatch.setattr(seq2, "ticks_ms", lambda: now_ms[0])
+    use_linear_ticks(monkeypatch)
+
+    class InputHardware:
+        k1_value = 0.5
+        k2_value = 0.5
+
+        def button1(self):
+            return False
+
+        def button2(self):
+            return False
+
+        def knob1(self):
+            return self.k1_value
+
+        def knob2(self):
+            return self.k2_value
+
+        def pop_clock_timestamp(self):
+            return None
+
+    hardware = InputHardware()
+    manager = InputManager(hardware)
+    manager.poll()
+
+    hardware.k1_value = 0.99
+    hardware.k2_value = 0.99
+    assert len([event for event in manager.poll() if isinstance(event, seq2.KnobTurn)]) == 2
+
+    now_ms[0] += 50
+    hardware.k1_value = 1.0
+    hardware.k2_value = 1.0
+    high_events = [event for event in manager.poll() if isinstance(event, seq2.KnobTurn)]
+    assert [event.value for event in high_events] == [1.0, 1.0]
+
+    sequencer = make_sequencer(1)
+    track = sequencer.tracks[0]
+    track.engines["EUC"].g1.set_prob(99)
+    transport = Transport(None)
+    app = AppState()
+    app._set_page(1)
+    app.sel = 6  # PRB1
+    app.k2_picked = True
+    controller = Controller(None, app, transport, sequencer, None, None, None)
+    pages = Pages(app, transport, sequencer, controller.editor.set)
+    controller.pages = pages
+    controller.dispatch(high_events[1])
+    assert track.engines["EUC"].g1.prob == 100
+
+    hardware.k1_value = 0.01
+    hardware.k2_value = 0.01
+    assert len([event for event in manager.poll() if isinstance(event, seq2.KnobTurn)]) == 2
+
+    now_ms[0] += 50
+    hardware.k1_value = 0.0
+    hardware.k2_value = 0.0
+    low_events = [event for event in manager.poll() if isinstance(event, seq2.KnobTurn)]
+    assert [event.value for event in low_events] == [0.0, 0.0]
+
+
 def test_din_schedule_failure_is_counted(monkeypatch):
     class Pin:
         IRQ_FALLING = 4

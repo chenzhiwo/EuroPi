@@ -202,6 +202,8 @@ DISPLAY_TIMING_MIN_PERIOD_US = (
 )
 DEBOUNCE_MS = 30
 KNOB_DEADBAND = 0.01
+KNOB_ACTIVE_DEADBAND = 0.002
+KNOB_ACTIVE_TIMEOUT_MS = 200
 SAVE_NOTICE_MS = 1_000
 SAVE_NOTICE_TEXT = "SAVED"
 SAVE_PENDING_TEXT = "SAVING"
@@ -583,6 +585,8 @@ class InputManager:
         self._knob2 = KnobTurn(2, 0.0)
         self._knob1_last = -1.0
         self._knob2_last = -1.0
+        self._knob1_active_until = None
+        self._knob2_active_until = None
         self._clock_events = [ClockEvent() for _ in range(CLOCK_QUEUE_CAPACITY)]
 
     def poll(self):
@@ -618,13 +622,31 @@ class InputManager:
                 events.append(ButtonEvent("B2", "press"))
         self._b2_down = d2
 
-        v1 = self.hw.knob1()
-        if abs(v1 - self._knob1_last) >= KNOB_DEADBAND:
+        v1 = min(max(self.hw.knob1(), 0.0), 1.0)
+        k1_active = (
+            self._knob1_active_until is not None
+            and ticks_diff(now, self._knob1_active_until) < 0
+        )
+        if not k1_active:
+            self._knob1_active_until = None
+        k1_threshold = KNOB_ACTIVE_DEADBAND if k1_active else KNOB_DEADBAND
+        if self._knob1_last < 0.0 or abs(v1 - self._knob1_last) >= k1_threshold:
+            if self._knob1_last >= 0.0:
+                self._knob1_active_until = ticks_add(now, KNOB_ACTIVE_TIMEOUT_MS)
             self._knob1_last = v1
             self._knob1.value = v1
             events.append(self._knob1)
-        v2 = self.hw.knob2()
-        if abs(v2 - self._knob2_last) >= KNOB_DEADBAND:
+        v2 = min(max(self.hw.knob2(), 0.0), 1.0)
+        k2_active = (
+            self._knob2_active_until is not None
+            and ticks_diff(now, self._knob2_active_until) < 0
+        )
+        if not k2_active:
+            self._knob2_active_until = None
+        k2_threshold = KNOB_ACTIVE_DEADBAND if k2_active else KNOB_DEADBAND
+        if self._knob2_last < 0.0 or abs(v2 - self._knob2_last) >= k2_threshold:
+            if self._knob2_last >= 0.0:
+                self._knob2_active_until = ticks_add(now, KNOB_ACTIVE_TIMEOUT_MS)
             self._knob2_last = v2
             self._knob2.value = v2
             events.append(self._knob2)
