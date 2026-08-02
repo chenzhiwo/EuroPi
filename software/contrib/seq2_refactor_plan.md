@@ -427,7 +427,78 @@ CV `pos` 从 schema v2 起不再保存；EUC 和 CV 在 load 后都按统一 res
 - 无效轨道类型回退为 EUC，并记录诊断；
 - 单轨损坏不应导致其他轨道全部丢失。
 
-### 8.3 保存策略
+### 8.3 PlatformIO 原生持久化格式预案
+
+本节记录未来将 Seq2 迁移到 PlatformIO/C++ 时的数据保存决策，不改变当前 MicroPython 版本的
+JSON 存档实现。8.2 定义的是逻辑 schema；JSON、CBOR 或自定义二进制只是该 schema 的磁盘编码，
+两者应保持分离。
+
+格式比较：
+
+| 格式 | 优点 | 缺点 | Seq2 适用性 |
+| --- | --- | --- | --- |
+| JSON | 可读、容易迁移和调试 | 体积较大，解析器可能使用动态内存 | 适合作为导入导出格式 |
+| CBOR | 标准化、紧凑，数据模型接近 JSON | 不方便人工直接查看 | 最合适的单一通用替代品 |
+| Protobuf/nanopb | schema 演进和跨语言支持较强 | 需要 `.proto` 和代码生成，工程复杂度更高 | 当前需求下偏重 |
+| 自定义 TLV | 体积最小、解析时间确定、可完全避免动态分配 | 需要自行维护 codec 和兼容规则 | 最适合设备内部格式 |
+| 直接保存 C++ struct | 初始实现简单 | 受 padding、字节序、enum 大小、ABI 和版本变化影响 | 禁止作为长期存档格式 |
+
+PlatformIO 原生版本优先采用双层方案：
+
+1. **设备内部：** LittleFS + A/B 双槽 + 带版本号和 CRC32 的自定义 TLV 二进制；
+2. **设备外部：** 保留 JSON，作为旧项目迁移、备份、人工检查和未来桌面工具的交换格式；
+3. 如果不希望维护两套 codec，则退而选择 CBOR 作为统一格式；CBOR 采用
+   [RFC 8949](https://www.rfc-editor.org/rfc/rfc8949)，可评估核心编解码不要求动态分配的
+   [TinyCBOR](https://intel.github.io/tinycbor/current/)；
+4. 只有出现多固件/多语言共享 schema、网络协议或大型桌面编辑器需求时，才重新评估
+   [nanopb](https://chromium.googlesource.com/external/github.com/nanopb/nanopb/+/master/docs/index.md)。
+
+内部记录建议布局：
+
+```text
+Header
+  magic[4]        = "SQ2\0"
+  format_version  uint16
+  payload_length  uint16
+  generation      uint32
+  crc32           uint32
+
+Payload
+  Clock TLV
+  Track 1 TLV
+  Track 2 TLV
+  Track 3 TLV
+```
+
+编码约束：
+
+- BPM 使用 `uint16`；steps、pulses、rotate、probability、gate length 等有界参数优先使用
+  `uint8`；
+- 电压使用明确单位的整数定点值，例如毫伏 `uint16`，不得直接持久化裸 `float`；
+- 所有多字节整数固定字节序，不依赖 MCU 或编译器的原生布局；
+- TLV reader 必须能按 length 跳过未知 type，新增可选字段不得阻止旧固件读取其余已知字段；
+- `format_version` 负责结构迁移，加载后仍执行与 JSON schema 相同的默认值、clamp 和逐轨恢复；
+- codec 接受调用方提供的固定 buffer，不在保存或加载路径隐式分配对象。
+
+掉电安全采用两个独立槽位，例如 `seq2_a.bin` 和 `seq2_b.bin`：
+
+1. 启动时分别验证 magic、版本、长度和 CRC，选择 `generation` 最大的有效槽；
+2. 保存时只写非当前槽，完整写入并 `close`/`sync` 后重新校验；
+3. 新槽验证成功后才允许后续启动选中它，旧槽至少保留到下一次成功保存；
+4. 两槽均无效时加载默认项目并报告可见诊断，不尝试解释部分记录。
+
+[littlefs](https://github.com/littlefs-project/littlefs) 本身具有写时复制、原子文件操作和掉电恢复设计；
+应用层仍保留 CRC、generation 和双槽，以检测截断、逻辑损坏并提供上一代回退。当前 Seq2 项目数据不足
+1 KiB，选择二进制格式的主要理由不是节省 flash，而是确定的内存/时间开销、无动态分配和可靠升级。
+
+从 MicroPython 迁移时，PlatformIO 固件的首个可迁移版本应保留只读 JSON importer：成功解析旧
+`saved_state_Seq2.txt` 后进行完整校验，再写入二进制 A/B 槽；在二进制回读验证成功前不得删除或覆盖
+旧 JSON。JSON exporter 可以放在 USB/串口维护工具中，不要求进入实时路径。
+
+此方案是 PlatformIO 迁移的设计记录，不是当前重构阶段的立即实施项；实际落地前仍需用目标 C++
+框架确认 LittleFS 配置、flash 分区、断电注入测试方法及 codec 的静态 RAM 占用。
+
+### 8.4 保存策略
 
 B2 长按产生 `SaveRequested`，PersistenceService 负责：
 
